@@ -116,8 +116,7 @@ class ClassReference(Returnable):
     def getClass(self):
         _ = self.get() # Ensures the ClassReference points to something, before dispensing address
         return self.className
-class ClassType(Returnable): # Note: this is only for using during runtime
-    """Type descriptor for class names (e.g., 'Calculator' in variable declarations)."""
+class ClassType(Returnable):
     def __init__(self, className: str):
         self.className = className
     def get(self):
