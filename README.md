@@ -2,7 +2,8 @@
 P-JDK is an interesting replica of the popular Java programming language, created inside Python!
 
 To play around with P-JDK and test its limits, just download the latest release in the Releases page. It does not require Python since it is bundled into an executable, created by PyInstaller. 
-However, if you want to recompile / run PJDK without using the executable (since no one trusts anything these days), the source code is presented as-is inside sources/PJDK.py. 
+
+However, if you want to recompile / run PJDK without using the executable (since no one trusts anything these days), the source code is presented as-is inside sources/PJDK.py. To directly run it, it requires Python 3.12+
 
 Of course, code made inside P-JDK are hundreds or even thousands of times slower than a real JDK. Obviously, this is not meant to be actually used, and rather a cool project.
 
