@@ -13,6 +13,15 @@ Defining methods:
 ```
 public int add(int x, int y) { }
 ```
+Creating statements:
+```
+if (a == 1) { }
+```
+Calling methods:
+```
+bob.sayHello();
+alice.sayHello();
+```
 And much more!
 
 # Coming soon
