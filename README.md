@@ -47,4 +47,3 @@ These will be featured in next releases:
 
 These are some issues that you may notice that may not be fixed in the next releases:
 - Compiling messages may not match with actual issue
-- 
