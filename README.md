@@ -1,8 +1,8 @@
 # Python-JDK
 P-JDK is an interesting replica of the popular Java programming language, created inside Python!
 
-To play around with P-JDK and test its limits, just download the latest release in the Releases page.
-
+To play around with P-JDK and test its limits, just download the latest release in the Releases page. It does not require Python since it is bundled into an executable, created by PyInstaller. 
+Of course, code made inside P-JDK are hundreds or even thousands of times slower than a real JDK. Obviously, this is not meant to be actually used, and rather a cool project. 
 
 # Supports
 P-JDK supports all basic Java syntax (and fully replicates it), like defining classes:
@@ -29,3 +29,7 @@ These will be featured in next releases:
 - Strings
 - A simple print statement
 - For loops
+
+These are some issues that you may notice that may not be fixed in the next releases:
+- Compiling messages may not match with actual issue
+- 
