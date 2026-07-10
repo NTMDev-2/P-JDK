@@ -1,10 +1,3 @@
-"""
-Pava
-The coolest object-oriented-programming language written with Python
-The syntax is basically a copy of Java. One significant thing that is not included is the "protected" access modifier.
-An interesting quirk is that in this OOP, methods are evaluated and parsed at runtime, not when compiled, which allows for some interesting
-mechanics, like definining functions it needs after its definition. This is similar to how Python functions work.
-"""
 from typing import Any#, Optional
 import operator as pyop
 from pathlib import Path
