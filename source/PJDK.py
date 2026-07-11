@@ -2094,7 +2094,7 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
     return popFrame().returnValue
 
 #
-content = (Path(__file__).parent / (input('Enter file name: ') + '.txt').read_text(encoding="utf-8")
+content = (Path(__file__).parent / (input('Enter file name: ') + '.txt')).read_text(encoding="utf-8")
 Exec = Execution(Intepreter(content)) 
 Exec.executeTokens()
 invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
