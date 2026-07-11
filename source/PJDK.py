@@ -1685,18 +1685,45 @@ class Method:
             if self.next(by=4+parseIdBy) == '=':
                 forLoopStmt = self.read(self.peek(), ')')
                 idTypeRead = self.peek(by=2+parseIdBy).get()
+                semiIdxs = [i for i, tok in enumerate(forLoopStmt) if tok.get()['type'] == 'SEMICOLON']
+                bounds = [-1] + semiIdxs + [len(forLoopStmt)]
+                forLoopParts = [forLoopStmt[bounds[k]+1:bounds[k+1]] for k in range(len(bounds)-1)]
+                
+                condition = forLoopParts[1]
+                try:
+                    varUpdateExpr = forLoopParts[2]
+                except IndexError: # There is no update statement
+                    varUpdateExpr = None
+                    pass 
+
                 if idTypeRead['type'] in RETURN_TYPES:
                     idType = parseTokenAsType(idTypeRead['val'], isUnsigned=isUnsigned)
                     idName = self.next(by=3+parseIdBy)
                     idValue = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(by=5), ';'))
-                    self.forLocalVar[idName] = {
-                        'name': idName,
-                        'type': idType,
-                        'value': idValue
-                    }
+                    self.me.setLocal(idName, idType, idValue)
                 else:
                     resolveValue(self.me, self.me.getArgs(), self.next(by=3+parseIdBy)) # just check if it exists
-                print(self.forLocalVar)
+                self.tokPosition += len(forLoopStmt) + 2
+                body_start = self.tokPosition 
+                self.isInLoop = True
+                while True:
+                    condition_result = BooleanExpression.evaluate(self.me, self.args, condition)
+                    if not condition_result.get():
+                        break
+                    self.tokPosition = body_start
+                    state = self.executeBlock()
+                    if state == 'break':
+                        break
+                    elif state == 'continue':
+                        pass  # still needs to increment
+                    elif state is True:
+                        self.isInLoop = False
+                        return True
+                    if varUpdateExpr is not None:
+                        newVal = Expression.evaluate(self.me, self.args, varUpdateExpr[2:])
+                        self.me.changeLocal(idName, newVal)
+                del self.me.locals[idName]
+                self.isInLoop = False
             elif self.next(by=4+parseIdBy) == ':':
                 pass
             else:
