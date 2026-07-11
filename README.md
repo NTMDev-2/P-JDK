@@ -42,6 +42,8 @@ Note: The entry class name is optional, and does not have to be the name of the 
 
 # Coming soon
 These will be featured in next releases:
+- The `char` type
+- For-each loops
 - Primitive arrays
 
 Features that will be coming later:
