@@ -3,6 +3,7 @@ import operator as pyop
 from pathlib import Path
 import struct
 import os
+import traceback
 
 staticVariables: dict[str, dict] = {}
 staticMethods: dict[str, dict] = {}
@@ -1558,6 +1559,11 @@ class Method:
             var_name, arrayType, array_value, self.tokPosition = result
             self.me.setLocal(var_name, PrimitiveArrayWrapper(arrayType), array_value)
             return False
+        elif tok_type == 'IDENTIFIER' and self.next() in ['+', '-'] and self.next(2) in ['+', '-']: # x++ or x--
+            if self.next() == '+':
+                if self.next(by=2) != '+':
+                    raise NameError('Malformed incremental expression')
+                
         elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.peek().get()['type'] == 'DOT': # Dot expr
             obj_token = token
             obj_name = tok_val
@@ -2300,9 +2306,15 @@ while choice == 'Retry':
     if oldContent == content:
         print(f'[WARNING]: File reloading did not detect any changes in file. Did you save the file {fileName}?')
     print('OUTPUT:\n')
-    Exec = Execution(Intepreter(content)) 
-    Exec.executeTokens()
-    invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+    try:
+        Exec = Execution(Intepreter(content))
+        Exec.executeTokens()
+        invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+    except Exception as e:
+        for line in traceback.format_exception(e)[1:-1]:
+            print(line.strip())
+        print(f'\n[ERROR]: {traceback.format_exception(e)[-1]}')
+
     choice = 'Retry' if not input('\n[ENTER]: Reload file [OTHER+ENTER]: Exit console') else ''
     if choice == 'Retry':
         Exec.reset()
