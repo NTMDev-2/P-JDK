@@ -2,8 +2,6 @@ from typing import Any#, Optional
 import operator as pyop
 from pathlib import Path
 import struct
-import ctypes
-import sys
 
 staticVariables: dict[str, dict] = {}
 staticMethods: dict[str, dict] = {}
@@ -120,8 +118,6 @@ class ClassType(Returnable):
         return self.className
     def __repr__(self):
         return f"ClassType({self.className})"
-
-
 
 def isAllowedAtThisScope(modifier: str, thisScope: str) -> bool: 
     isValidModifier(modifier)
@@ -361,7 +357,7 @@ def newPrimitiveArray(element_type: object, size: int, initial_values: list | No
         while len(initial_values) < size:
             initial_values.append(default)
     return PrimitiveArray(size, initial_values, element_type)
-
+TokenSlice = list['Token']
 class PrimitiveArray(Returnable):
     def __init__(self, size: int, initialValues: list, listType: object):
         if len(initialValues) > size:
@@ -407,6 +403,60 @@ class PrimitiveArrayWrapper(PrimitiveArray):
     def getArrayType(self):
         return self._type
 
+class ArrayAssignment:
+    @staticmethod
+    def parse(lang: TokenSlice, tokPosition: int, elementTypeTok: str,
+              me: StackFrame | None = None, methodArgs: list | None = None):
+        # <type>[<size?>] <name> [= <value>];
+        arrayType = parseTokenAsType(elementTypeTok)
+        pos = tokPosition + 1
+        if pos >= len(lang) or lang[pos].get()['type'] != 'LBRACKET':
+            return None
+
+        close_bracket = matchingBracket(lang, pos)
+
+        declared_size = None
+        if close_bracket > pos + 1:
+            size_tokens = lang[pos + 1:close_bracket]
+            size_value = Expression.evaluate(me, methodArgs, size_tokens)
+            if not isinstance(size_value, Int):
+                raise RuntimeError("Array size must be an integer")
+            declared_size = size_value.get()
+
+        pos = close_bracket + 1
+        if pos >= len(lang) or lang[pos].get()['type'] != 'IDENTIFIER':
+            raise SyntaxError("Expected identifier after array type")
+
+        var_name = lang[pos].get()['val']
+        pos += 1
+
+        if pos >= len(lang):
+            raise SyntaxError("Unexpected end of tokens in array declaration")
+
+        if lang[pos].get()['type'] == 'SEMICOLON':
+            array_value = newPrimitiveArray(arrayType, declared_size if declared_size is not None else 0)
+            return var_name, arrayType, array_value, pos + 1
+
+        if lang[pos].get()['type'] != 'ASSIGN':
+            raise SyntaxError("Expected '=' or ';' after array name")
+        pos += 1
+
+        rhs_tokens = []
+        while pos < len(lang) and lang[pos].get()['type'] != 'SEMICOLON':
+            rhs_tokens.append(lang[pos])
+            pos += 1
+        if pos >= len(lang) or lang[pos].get()['type'] != 'SEMICOLON':
+            raise SyntaxError("Expected ';' after array declaration")
+        pos += 1
+        array_value = Expression.evaluate(me, methodArgs, rhs_tokens)
+        if not isinstance(array_value, PrimitiveArray):
+            raise RuntimeError(f"Cannot assign non-array value to array variable '{var_name}'")
+        if declared_size is not None and array_value.size != declared_size:
+            raise RuntimeError(
+                f"Array size mismatch for '{var_name}': declared size {declared_size}, got {array_value.size}"
+            )
+        
+        return var_name, arrayType, array_value, pos
 
 class EvalTokens():
     TOKENS = {
@@ -827,7 +877,7 @@ OPERATORS = [EvalTokens.TOKENS['+'], EvalTokens.TOKENS['-'], EvalTokens.TOKENS['
 BOOL_OPERATORS = [EvalTokens.SINGLE_CHAR_OP['>'], EvalTokens.SINGLE_CHAR_OP['<'], EvalTokens.TWO_CHAR_OP['&&'], EvalTokens.TWO_CHAR_OP['||'], EvalTokens.TWO_CHAR_OP['>='],
 EvalTokens.TWO_CHAR_OP['<='], EvalTokens.SINGLE_CHAR_OP['!'], EvalTokens.TWO_CHAR_OP['=='], EvalTokens.TWO_CHAR_OP['!=']]
 LOOP_ACTIONS = [EvalTokens.TOKENS['break'], EvalTokens.TOKENS['continue']]
-TokenSlice = list[Token]
+
 
 def parseTokenAsType(token: str, acceptVoid: bool = False, isUnsigned: bool = False) -> object:
     match token:
@@ -979,6 +1029,20 @@ def matchingBracket(tokens: TokenSlice, openIdx: int) -> int:
             if depth == 0:
                 return i
     raise SyntaxError('Unmatched bracket')
+def matchingBrace(tokens: TokenSlice, openIdx: int) -> int:
+    depth = 1
+    j = openIdx + 1
+    while j < len(tokens):
+        tt = tokens[j].get()['type']
+        if tt == 'LBRACE':
+            depth += 1
+        elif tt == 'RBRACE':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    raise SyntaxError("Unmatched '{' in array initializer")
+
 def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: TokenSlice, startIdx: int):
     leftToken = tokens[startIdx]
     leftName = leftToken.get()['val']
@@ -1039,25 +1103,43 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
             if i + 2 < len(tokens) and tokens[i + 2].get()['type'] == 'LBRACKET':
                 element_type_token = tokens[i + 1].get()['val']
                 element_type = parseTokenAsType(element_type_token)
-                
+
                 close_bracket = matchingBracket(tokens, i + 2)
-                
+
+                declared_size = None
                 if close_bracket > i + 3:
-                    size_tokens = tokens[i + 3 : close_bracket]
+                    size_tokens = tokens[i + 3:close_bracket]
                     size_value = Expression.evaluate(me, methodArgs, size_tokens)
                     if not isinstance(size_value, Int):
                         raise RuntimeError("Array size must be an integer")
-                    size = size_value.get()
-                    array_obj = newPrimitiveArray(element_type, size)
-                    out.append(Token.wrap(array_obj))
+                    declared_size = size_value.get()
+
+                next_idx = close_bracket + 1
+
+                # Check for initializer list: new Type[]{...} or new Type[size]{...}
+                if next_idx < len(tokens) and tokens[next_idx].get()['type'] == 'LBRACE':
+                    close_brace = matchingBrace(tokens, next_idx)
+                    elem_groups = Token.splitArgs(tokens[next_idx + 1:close_brace])
+                    initial_values = []
+                    for group in elem_groups:
+                        if not group:
+                            continue
+                        val = Expression.evaluate(me, methodArgs, group)
+                        initial_values.append(convertValue(val, element_type))
+
+                    size = declared_size if declared_size is not None else len(initial_values)
+                    if len(initial_values) > size:
+                        raise RuntimeError(
+                            f"Array initializer has {len(initial_values)} elements, exceeds declared size {size}"
+                        )
+                    array_obj = newPrimitiveArray(element_type, size, initial_values)
+                    i = close_brace + 1
                 else:
-                    # new int[] {1, 2, 3} - need to handle initializer list
-                    # This requires scanning for the '{' after the ']'
-                    # (Simplified: just create empty array with size 0)
-                    array_obj = newPrimitiveArray(element_type, 0)
-                    out.append(Token.wrap(array_obj))
-                
-                i = close_bracket + 1
+                    size = declared_size if declared_size is not None else 0
+                    array_obj = newPrimitiveArray(element_type, size)
+                    i = next_idx
+
+                out.append(Token.wrap(array_obj))
                 continue
             else:
                 className = tokens[i+1].get()['val']
@@ -1468,59 +1550,12 @@ class Method:
             assignToClass = ClassReference(tok_val) if isClassAssign else None
             LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(1), ';'), assignToClass)
             return False
-        elif (tok_type in RETURN_TYPES) and self.peek().get()['type'] == 'LBRACKET': # Array definition
-            # Array declaration: int[] a = new int[10];
-            # Or: int[] a = {1, 2, 3};
-            
-            # Check if the next token after '[]' is an identifier
-            # We're at 'int', next is '['
-            bracket_pos = self.tokPosition + 1
-            if bracket_pos >= len(self.lang) or self.lang[bracket_pos].get()['type'] != 'LBRACKET':
+        elif (tok_type in RETURN_TYPES) and self.peek().get()['type'] == 'LBRACKET':
+            result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type, self.me, self.args)
+            if result is None:
                 return False
-            
-            # Skip past the '[]'
-            self.tokPosition = bracket_pos + 1  # skip '['
-            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'RBRACKET':
-                return False
-            
-            self.tokPosition += 1  # skip ']'
-            
-            # Now we should be at the variable name
-            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'IDENTIFIER':
-                return False
-            
-            var_name = self.lang[self.tokPosition].get()['val']
-            self.tokPosition += 1  # skip variable name
-            
-            # Next should be '='
-            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'ASSIGN':
-                # Could be ';' with no initializer? (int[] a;)
-                if self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
-                    # Store empty array
-                    self.me.setLocal(var_name, 'array', newPrimitiveArray(parseTokenAsType(tok_type), 0))
-                    self.tokPosition += 1
-                    return False
-                else:
-                    return False
-            
-            self.tokPosition += 1  # skip '='
-            
-            # Parse the RHS (new int[10] or {1,2,3})
-            rhs_tokens = []
-            while self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
-                rhs_tokens.append(self.lang[self.tokPosition])
-                self.tokPosition += 1
-            
-            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
-                raise SyntaxError("Expected ';' after array declaration")
-            
-            self.tokPosition += 1  # skip ';'
-            
-            # Evaluate the RHS to get the array
-            array_value = Expression.evaluate(self.me, self.args, rhs_tokens)
-            
-            # Store it
-            self.me.setLocal(var_name, 'array', array_value)
+            var_name, arrayType, array_value, self.tokPosition = result
+            self.me.setLocal(var_name, PrimitiveArrayWrapper(arrayType), array_value)
             return False
         elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.peek().get()['type'] == 'DOT': # Dot expr
             obj_token = token
@@ -2100,6 +2135,29 @@ class Execution:
                             self.clear(noClearMode=True, noClearInfo=True)
                             self.tokPosition += 1
                             continue
+            elif tok_type in RETURN_TYPES and 'field_def' in self.mode and self.peek().get()['type'] == 'LBRACKET':
+                modifier = 'default'
+                i = self.tokPosition - 1
+                while i >= 0:
+                    t = self.lang[i]
+                    if t.get()['type'] in ('NEWLINE', 'SEMICOLON', 'START_DECLARATION'):
+                        break
+                    if t.get()['type'] in ACCESS_MODIFIERS or t.get()['val'] in ['public', 'private', 'protected', 'default']:
+                        modifier = t.get()['val']
+                        break
+                    i -= 1
+                self.mode = []
+                result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type)  # me/methodArgs default None -> field context
+                if result is None:
+                    raise SyntaxError("Malformed array field declaration")
+                var_name, arrayType, array_value, self.tokPosition = result
+                setField(
+                    ClassReference(self.currentClass), var_name, modifier,
+                    PrimitiveArrayWrapper(arrayType), array_value,
+                    isStatic=self.states['STATIC'], isFinal=self.states['FINAL']
+                )
+                self.clear(noClearMode=True, noClearInfo=True)
+                continue
             elif tok_type == EvalTokens.TOKENS['('] and not is_constructor_call: # METHOD
                 if 'method_def' in self.mode:
                     # <modifier>, <static?>, <unsigned?>, <return_type>, <method_name> ( <...>
@@ -2215,8 +2273,8 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
     m.execute()
     return popFrame().returnValue
 
-#
-content = (Path(__file__).parent / file_name).read_text(encoding="utf-8")
+#(input('Enter file name: ') + '.txt'
+content = (Path(__file__).parent / 'TestPyOOP.txt').read_text(encoding="utf-8")
 Exec = Execution(Intepreter(content)) 
 Exec.executeTokens()
 invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
