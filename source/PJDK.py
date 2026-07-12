@@ -2,6 +2,7 @@ from typing import Any#, Optional
 import operator as pyop
 from pathlib import Path
 import struct
+import os
 
 staticVariables: dict[str, dict] = {}
 staticMethods: dict[str, dict] = {}
@@ -1947,6 +1948,16 @@ class Execution:
         }
         self.currentClass: str = ''
         self.info: dict[str, Any] = {} # Memory for the parser
+    def reset(self):
+        global ENTRY, nextHeapId, heap, memory, staticMethods, staticVariables
+        self.lang = []
+        ENTRY = {'entryClass': '', 'entryMethod': ENTRY_METHOD_NAME}
+        nextHeapId = 0
+        memory.clear()
+        memory = {'Object': {'name': 'Object'}}
+        heap.clear()
+        staticVariables.clear()
+        staticVariables.clear()
     def before(self, by: int = 1, getType: str = 'val'):
         return self.lang[self.tokPosition - by].get()[getType]
     def next(self, by: int = 1, getType: str = 'val'):
@@ -2273,10 +2284,28 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
     m.execute()
     return popFrame().returnValue
 
-#
-content = (Path(__file__).parent / (input('Enter file name: ') + '.txt')).read_text(encoding="utf-8")
-Exec = Execution(Intepreter(content)) 
-Exec.executeTokens()
-invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+choice = 'Retry'
+fileName = (input('Enter file name: ') + '.txt')
+if fileName == '.txt':
+    print('[INFO]: Defaulted file name to \'Test\'')
+    fileName = 'Test.txt'
+oldContent = ''
+while choice == 'Retry':
+    try:
+        content = (Path(__file__).parent / fileName).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f'[WARNING]: The file was not found in directory {Path(__file__).parent}')
+        fileName = (input('Enter file name: ') + '.txt')
+    os.system('cls')
+    if oldContent == content:
+        print(f'[WARNING]: File reloading did not detect any changes in file. Did you save the file {fileName}?')
+    print('OUTPUT:\n')
+    Exec = Execution(Intepreter(content)) 
+    Exec.executeTokens()
+    invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+    choice = 'Retry' if not input('\n[ENTER]: Reload file [OTHER+ENTER]: Exit console') else ''
+    if choice == 'Retry':
+        Exec.reset()
+    os.system('cls')
+    oldContent = content
 
-input('Press enter to continue...')
