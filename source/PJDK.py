@@ -1551,7 +1551,7 @@ class Method:
             self.tokPosition += 1 + parseBy
             if self.next(1+parseBy) == '=':
                 assignToClass = ClassReference(tok_val) if isClassAssign else None
-                LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(1+parseBy), ';'), assignToClass)
+                LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(2+parseBy), ';'), assignToClass)
             elif self.next(1+parseBy) == ';':
                 self.me.setLocal(var_name, parseTokenAsType(tok_val), default_value_for_type(parseTokenAsType(tok_val)))
             return False
