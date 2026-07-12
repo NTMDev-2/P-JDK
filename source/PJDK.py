@@ -1478,22 +1478,21 @@ class Method:
             else:
                 break
         return self.lang[startRead:endRead]
-    def before(self, by: int = 1, getType: str = 'val'):
+    def before(self, by: int = 1, getType: str = 'val') -> str:
         try:
             return self.lang[self.tokPosition - by].get()[getType]
         except IndexError:
-            pass
-    def next(self, by: int = 1, getType: str = 'val'):
+            return 
+    def next(self, by: int = 1, getType: str = 'val') -> str:
         try:
             return self.lang[self.tokPosition + by].get()[getType]
         except IndexError:
-            pass
-    def peek(self, by: int = 1):
+            return
+    def peek(self, by: int = 1) -> Token:
         return self.lang[self.tokPosition + by]
     def parse(self):
         if not self.methodBody:
             print(f'[WARNING] Method {self.methodName} of class {self.className} has no body to execute')
-            return
         self.methodParse = Intepreter(self.methodBody)
         self.methodParse.parse()
         self.lang = self.methodParse.get() 
@@ -1543,13 +1542,18 @@ class Method:
             isClassAssign = True
         except Exception:
             isClassAssign = False
-        if (tok_type in RETURN_TYPES or isClassAssign) and self.next(by=2) == '=': # Local definition
+        if (tok_type in RETURN_TYPES or isClassAssign) and (self.next(by=2) == '=' or self.next(by=2) == ';'): # Local definition
             # <type> <name> = <value>;
+            # <type> <name>;
             isUnsignedType = (self.before() == 'unsigned')
+            parseBy = 1 if isUnsignedType else 0
             var_name = self.next()
-            self.tokPosition += 2
-            assignToClass = ClassReference(tok_val) if isClassAssign else None
-            LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(1), ';'), assignToClass)
+            self.tokPosition += 1 + parseBy
+            if self.next(1+parseBy) == '=':
+                assignToClass = ClassReference(tok_val) if isClassAssign else None
+                LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(1+parseBy), ';'), assignToClass)
+            elif self.next(1+parseBy) == ';':
+                self.me.setLocal(var_name, parseTokenAsType(tok_val), default_value_for_type(parseTokenAsType(tok_val)))
             return False
         elif (tok_type in RETURN_TYPES) and self.peek().get()['type'] == 'LBRACKET':
             result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type, self.me, self.args)
@@ -1939,13 +1943,15 @@ class Method:
                 self.tokPosition += 1
             return False
         elif tok_type == 'FOR':
-            # for (<type> <id> = <val>; <id_reference_condition>; <stmt?>)
-            # for (<type> <id> : <collectionID>)
+            # for (<type?> <id> = <val>; <id_reference_condition>; <stmt?>)
+            # for (<type?> <id> : <collectionID>)
             parseIdBy = 0
             isUnsigned = False 
             if self.next(by=2) == 'unsigned':
                 isUnsigned = True
                 parseIdBy += 1
+            if self.next(by=2,getType='type') not in RETURN_TYPES:
+                parseIdBy -= 1
             if self.next(by=4+parseIdBy) == '=':
                 forLoopStmt = self.read(self.peek(), ')')
                 idTypeRead = self.peek(by=2+parseIdBy).get()
@@ -1965,8 +1971,10 @@ class Method:
                     idName = self.next(by=3+parseIdBy)
                     idValue = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(by=5), ';'))
                     self.me.setLocal(idName, idType, idValue)
+                    wasLocallyDefined = True
                 else:
-                    resolveValue(self.me, self.me.getArgs(), self.next(by=3+parseIdBy)) # just check if it exists
+                    resolveValue(self.me, self.me.getArgs(), self.peek(by=3+parseIdBy)) # just check if it exists
+                    wasLocallyDefined = False
                 self.tokPosition += len(forLoopStmt) + 2
                 body_start = self.tokPosition 
                 self.isInLoop = True
@@ -2002,7 +2010,8 @@ class Method:
                                 else: # Default to expr
                                     newVal = Expression.evaluate(self.me, self.args, varUpdateExpr[2:])
                                     self.me.changeLocal(idName, newVal)
-                del self.me.locals[idName]
+                if wasLocallyDefined:
+                    del self.me.locals[idName]
                 self.isInLoop = False
             elif self.next(by=4+parseIdBy) == ':':
                 pass
@@ -2333,9 +2342,8 @@ class Execution:
                 arg_type = ClassReference(arg_type_token) # If it is not a primitive type, then it must be a class reference
             self.info['thisMethodArgs'][arg_name] = arg_type # Do not set into self.argumentStack
         return self.info['thisMethodArgs']
-    def handleNullFieldDefinition(self, type: object, modifier: str):
-        # Notice the lack of "initialValue". By default, it is set to Null().
-        setField(ClassReference(self.currentClass), self.next(), modifier, type, isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
+    def handleNullFieldDefinition(self, _type: object, modifier: str):
+        setField(ClassReference(self.currentClass), self.next(), modifier, _type, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
     def handleMethodDefinition(self, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool, methodArgs: dict):
         createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, isStatic, argsList(methodArgs))
         self.clear(noClearMode=True, noClearInfo=True)
