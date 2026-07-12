@@ -1118,7 +1118,6 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
 
                 next_idx = close_bracket + 1
 
-                # Check for initializer list: new Type[]{...} or new Type[size]{...}
                 if next_idx < len(tokens) and tokens[next_idx].get()['type'] == 'LBRACE':
                     close_brace = matchingBrace(tokens, next_idx)
                     elem_groups = Token.splitArgs(tokens[next_idx + 1:close_brace])
@@ -1559,11 +1558,56 @@ class Method:
             var_name, arrayType, array_value, self.tokPosition = result
             self.me.setLocal(var_name, PrimitiveArrayWrapper(arrayType), array_value)
             return False
-        elif tok_type == 'IDENTIFIER' and self.next() in ['+', '-'] and self.next(2) in ['+', '-']: # x++ or x--
-            if self.next() == '+':
-                if self.next(by=2) != '+':
-                    raise NameError('Malformed incremental expression')
-                
+        elif tok_type == 'IDENTIFIER' and self.peek().get()['type'] in ('INC', 'DEC'): # x++ or x--
+            var_name = tok_val
+            delta = 1 if self.peek().get()['type'] == 'INC' else -1
+            self.tokPosition += 2
+            if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                self.tokPosition += 1
+
+            current_value = resolveValue(self.me, self.args, token)
+            new_value = type(current_value)(current_value.get() + delta)
+            updated = False
+
+            # Local
+            try:
+                self.me.changeLocal(var_name, new_value)
+                updated = True
+            except RuntimeError:
+                pass
+
+            # Static
+            if not updated:
+                if self.me.class_name in staticVariables and var_name in staticVariables[self.me.class_name]:
+                    isChangeable(staticVariables[self.me.class_name][var_name])
+                    staticVariables[self.me.class_name][var_name]['value'] = new_value
+                    updated = True
+
+            # Instance field
+            if not updated and self.me.this is not None:
+                instance = self.me.this.get()
+                if var_name in instance.fields:
+                    field_def = memory[self.me.class_name]['fields'].get(var_name)
+                    if field_def and field_def.get('final', False):
+                        raise Exception(f"Cannot assign to final field '{var_name}'")
+                    instance.fields[var_name] = new_value
+                    updated = True
+
+            # Static in super
+            if not updated:
+                hierarchy = getHierarchyOfClass(self.me.class_name)
+                for super_name, _ in list(hierarchy.items()):
+                    if super_name == self.me.class_name:
+                        continue
+                    if super_name in staticVariables and var_name in staticVariables[super_name]:
+                        isChangeable(staticVariables[super_name][var_name])
+                        staticVariables[super_name][var_name]['value'] = new_value
+                        updated = True
+                        break
+
+            if not updated:
+                raise RuntimeError(f"Cannot find variable '{var_name}' to increment/decrement")
+            return False
         elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.peek().get()['type'] == 'DOT': # Dot expr
             obj_token = token
             obj_name = tok_val
@@ -1676,6 +1720,47 @@ class Method:
                         raise Exception(f"Cannot assign to final field '{member_name}'")
                     isConsistentTypes(field_def['type'], type(new_value))
                     instance.fields[member_name] = new_value
+                    return False
+                elif self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] in ('INC', 'DEC'):
+                    # this.x++ / Object.x++ / obj.x++
+                    delta = 1 if self.lang[self.tokPosition].get()['type'] == 'INC' else -1
+                    self.tokPosition += 1
+                    if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                        self.tokPosition += 1
+                    else:
+                        raise SyntaxError("Expected ';' after increment/decrement expression")
+
+                    if obj_name == 'this':
+                        target = self.me.this
+                        if target is None:
+                            raise RuntimeError("Cannot use 'this' in static context")
+                        instance = target.get()
+                        if member_name not in instance.fields:
+                            raise RuntimeError(f"Field '{member_name}' not found on object")
+                        field_def = memory[instance.className]['fields'].get(member_name)
+                        if field_def and field_def.get('final', False):
+                            raise Exception(f"Cannot assign to final field '{member_name}'")
+                        current_value = instance.fields[member_name]
+                        instance.fields[member_name] = type(current_value)(current_value.get() + delta)
+                    elif obj_name in memory:
+                        # Static: Object.x++
+                        if obj_name not in staticVariables or member_name not in staticVariables[obj_name]:
+                            raise NameError(f"Static variable '{member_name}' not found in class '{obj_name}'")
+                        isChangeable(staticVariables[obj_name][member_name])
+                        current_value = staticVariables[obj_name][member_name]['value']
+                        staticVariables[obj_name][member_name]['value'] = type(current_value)(current_value.get() + delta)
+                    else:
+                        target = resolveValue(self.me, self.args, obj_token)
+                        if not isinstance(target, ObjectReference):
+                            raise RuntimeError(f"'{obj_name}' is not an object reference")
+                        instance = target.get()
+                        if member_name not in instance.fields:
+                            raise RuntimeError(f"Field '{member_name}' not found on object")
+                        field_def = memory[instance.className]['fields'].get(member_name)
+                        if field_def and field_def.get('final', False):
+                            raise Exception(f"Cannot assign to final field '{member_name}'")
+                        current_value = instance.fields[member_name]
+                        instance.fields[member_name] = type(current_value)(current_value.get() + delta)
                     return False
                 else:
                     # ???
@@ -1894,19 +1979,35 @@ class Method:
                     if state == 'break':
                         break
                     elif state == 'continue':
-                        pass  # still needs to increment
+                        pass  # Must modify!
                     elif state is True:
                         self.isInLoop = False
                         return True
                     if varUpdateExpr is not None:
-                        newVal = Expression.evaluate(self.me, self.args, varUpdateExpr[2:])
-                        self.me.changeLocal(idName, newVal)
+                        # Increment
+                        if len(varUpdateExpr) >= 2:
+                            first_tok = varUpdateExpr[0]
+                            second_tok = varUpdateExpr[1] if len(varUpdateExpr) > 1 else None
+                            
+                            if first_tok.get()['type'] == 'IDENTIFIER' and second_tok:
+                                var_name = first_tok.get()['val']
+                                if second_tok.get()['type'] == 'INC':
+                                    current_val = self.me.getLocal(var_name, None, True)['value']
+                                    new_val = type(current_val)(current_val.get() + 1)
+                                    self.me.changeLocal(var_name, new_val)
+                                elif second_tok.get()['type'] == 'DEC':
+                                    current_val = self.me.getLocal(var_name, None, True)['value']
+                                    new_val = type(current_val)(current_val.get() - 1)
+                                    self.me.changeLocal(var_name, new_val)
+                                else: # Default to expr
+                                    newVal = Expression.evaluate(self.me, self.args, varUpdateExpr[2:])
+                                    self.me.changeLocal(idName, newVal)
                 del self.me.locals[idName]
                 self.isInLoop = False
             elif self.next(by=4+parseIdBy) == ':':
                 pass
             else:
-                raise RuntimeError(f'Could not evaluate iterable of {self.read(token, ')')}')
+                raise RuntimeError(f'Could not evaluate iterable of {self.read(token, ")")[0].getPos()}')
         elif tok_type in LOOP_ACTIONS:  # 'break', 'continue'
             self.tokPosition += 1 
             if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
@@ -2320,4 +2421,3 @@ while choice == 'Retry':
         Exec.reset()
     os.system('cls')
     oldContent = content
-
