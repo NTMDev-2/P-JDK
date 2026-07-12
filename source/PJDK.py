@@ -62,6 +62,8 @@ class UnsignedLong(_IntegerBase):   bits = 64; signed = False
 class Double(Numeric, Returnable):
     bits = 64
     def __init__(self, value: float = 0.0):
+        if isinstance(value, (Float, Double)):
+            value = value.get()
         self.value = float(value)
     def get(self): return self.value
     def to_bytes(self): return struct.pack('>d', self.value)
@@ -69,6 +71,8 @@ class Double(Numeric, Returnable):
 class Float(Numeric, Returnable):
     bits = 32
     def __init__(self, value: float = 0.0):
+        if isinstance(value, (Float, Double)):
+            value = value.get()
         self.value = struct.unpack('>f', struct.pack('>f', float(value)))[0]
     def get(self): return self.value
     def to_bytes(self): return struct.pack('>f', self.value)
@@ -550,7 +554,7 @@ class EvalTokens():
     'EQUALS': 3, 'NOT_EQUALS': 3,
     'LESS': 4, 'GREATER': 4, 'LESS_EQUAL': 4, 'GREATER_EQUAL': 4,
     'PLUS': 5, 'MINUS': 5,
-    'MULTIPLY': 6, 'DIVIDE': 6, 'MODULO': 6,
+    'MULTIPLY': 6, 'DIVIDE': 6, 'MODULO': 6, 'INT_DIVIDE': 6
     }
 class Token:
     def __init__(self, type_: str, value: str | object, line: int, column: int, truePos: int):
@@ -989,14 +993,15 @@ def toRPN(tokens: TokenSlice) -> TokenSlice:
     
     return output
 NUMERIC_RANK = [Byte, UnsignedByte, Short, UnsignedShort, Int, UnsignedInt, Long, UnsignedLong, Float, Double]
-ARITHMETIC_OPS = {'PLUS','MINUS','MULTIPLY','DIVIDE','MODULO'}
+ARITHMETIC_OPS = {'PLUS','MINUS','MULTIPLY','DIVIDE','MODULO','INT_DIVIDE'}
 def promote(a: Returnable, b: Returnable):
     return type(a) if NUMERIC_RANK.index(type(a)) >= NUMERIC_RANK.index(type(b)) else type(b)
 BIN_OPS = {
     'PLUS': lambda a, b: a + b,
     'MINUS': lambda a, b: a - b,
     'MULTIPLY': lambda a, b: a * b,
-    'DIVIDE': lambda a, b: int(a / b),
+    'DIVIDE': lambda a, b: float(a / b),
+    'INT_DIVIDE': lambda a, b: int(a // b),
     'MODULO': lambda a, b: a % b,
     'GREATER': pyop.gt, 'LESS': pyop.lt,
     'GREATER_EQUAL': pyop.ge, 'LESS_EQUAL': pyop.le,
@@ -1364,29 +1369,45 @@ class Expression:
                     stack.append(String(str(a.get()) + str(b.get())))
                     continue
                 else:
-                    result = BIN_OPS[t](a.get(), b.get())
-                
-                if t in ARITHMETIC_OPS:
-                    result_type = promote(a, b)
-                    result = result_type(result)
-                elif isinstance(result, bool):
-                    result = Bool(result)
-                elif isinstance(result, float):
-                    result = Double(result)
-                else:
-                    # fallback using assumeType
-                    if assumeType == 'int':
-                        result = Int(result)
-                    elif assumeType == 'long':
-                        result = Long(result)
-                    elif assumeType == 'byte':
-                        result = Byte(result)
-                    elif assumeType == 'short':
-                        result = Short(result)
-                    elif assumeType == 'float':
-                        result = Float(result)
+                    if t == 'DIVIDE':
+                        if isinstance(a, (Float, Double)) or isinstance(b, (Float, Double)):
+                            result = a.get() / b.get()
+                            if isinstance(a, Double) or isinstance(b, Double):
+                                result = Double(result)
+                            else:
+                                result = Float(result)
+                        else:
+                            result = int(a.get() / b.get())
+                            result = Int(result)
                     else:
+                        result = BIN_OPS[t](a.get(), b.get())
+                    
+                    if t in ARITHMETIC_OPS and t != 'DIVIDE':
+                        result_type = promote(a, b)
+                        result = result_type(result)
+                    elif isinstance(result, bool):
+                        result = Bool(result)
+                    elif isinstance(result, float):
                         result = Double(result)
+                    elif t == 'DIVIDE' and not isinstance(result, (Int, Float, Double)):
+                        if isinstance(result, float):
+                            result = Double(result)
+                        else:
+                            result = Int(result)
+                    else:
+                        # fallback using assumeType
+                        if assumeType == 'int':
+                            result = Int(result)
+                        elif assumeType == 'long':
+                            result = Long(result)
+                        elif assumeType == 'byte':
+                            result = Byte(result)
+                        elif assumeType == 'short':
+                            result = Short(result)
+                        elif assumeType == 'float':
+                            result = Float(result)
+                        else:
+                            result = Double(result)
                 stack.append(result)
                 continue
             stack.append(resolveOperand(me, methodArgs, tok))
