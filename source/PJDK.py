@@ -4,26 +4,6 @@ from pathlib import Path
 import struct
 import ctypes
 import sys
-print("file name(do not add the .txt part)")
-file_name = input() + ".txt"
-
-
-print("do you want to save the file(say y or n)")
-save = input()
-if save == "y":
-    user32 = ctypes.windll.user32
-
-    # Find a Notepad window by its title
-    hwnd = user32.FindWindowW(None, "*" + file_name + " - Notepad")  # Change the title if needed
-    if hwnd:
-        WM_COMMAND = 0x0111
-        ID_FILE_SAVE = 3  # Notepad's Save menu command
-        user32.SendMessageW(hwnd, WM_COMMAND, ID_FILE_SAVE, 0)
-    else:
-        print("Notepad window not found or was not needed to be updated")
-if save != "n" and save != "y":
-    print("??? that is not y or n run it again")
-    sys.exit()
 
 staticVariables: dict[str, dict] = {}
 staticMethods: dict[str, dict] = {}
