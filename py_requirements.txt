@@ -1,0 +1,10 @@
+Python 3.12+
+
+Used packages:
+typing
+operator
+pathlib
+os
+traceback
+
+Packages that require pip:
