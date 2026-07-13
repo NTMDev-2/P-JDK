@@ -39,15 +39,3 @@ public class Main{
 Note: The entry class name is optional, and does not have to be the name of the file it is in (since this is not a real Java environment)
 
 (Currently, there is no support for command line arguments (`String[] args`), so do not create that argument)
-
-# Coming soon
-These will be featured in next releases:
-- The `char` type
-- For-each loops
-- Primitive arrays
-
-Features that will be coming later:
-- Importing other files in different or same directory
-
-These are some issues that you may notice that may not be fixed in the next releases:
-- Compiling messages may not match with actual issue
