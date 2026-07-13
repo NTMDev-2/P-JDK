@@ -1,5 +1,5 @@
 # Python-JDK
-P-JDK is an interesting replica of the popular Java programming language, created inside Python!
+PJDK (pronounced Py-JDK) is an interesting replica of the popular Java programming language, created inside Python! 
 
 To play with P-JDK, the source code is presented inside source/PJDK.py. Download it, and it requires Python 3.12+ Intepreter to run. 
 
@@ -39,3 +39,5 @@ public class Main{
 Note: The entry class name is optional, and does not have to be the name of the file it is in (since this is not a real Java environment)
 
 (Currently, there is no support for command line arguments (`String[] args`), so do not create that argument)
+
+If you have difficulty creating the entry point, download a pre-made one from source/PJDK_Template.txt
