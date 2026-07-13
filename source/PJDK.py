@@ -1078,13 +1078,12 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
     leftToken = tokens[startIdx]
     leftName = leftToken.get()['val']
 
-    # Resolve the base of the chain.
     if leftName == 'this':
         if me is None or me.this is None:
             raise RuntimeError("Cannot use 'this' in static context")
         current = me.this
     elif leftName in memory:
-        current = leftName  # class-name context, for static field/method access
+        current = leftName
     else:
         current = resolveValue(me, methodArgs, leftToken)
 
@@ -1182,11 +1181,32 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                 out.append(Token.wrap(newObject(className)))
                 i = closeIdx + 1
                 continue
-        elif t in ('IDENTIFIER', 'THIS') and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'DOT':
+        elif t in ('IDENTIFIER', 'THIS') and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'DOT': # Complex call
             resolved, nextIdx = resolveDotChain(me, methodArgs, tokens, i)
             out.append(Token.wrap(resolved))
             i = nextIdx
             continue
+        elif t == '(' and tokens[i+1].get()['type'] in RETURN_TYPES and tokens[i+2].get()['val'] == ')' and tokens[i-1].get()['type'] != 'IDENTIFIER': # Casting
+            # (<type>) <value> <...?>;
+            castToType = tokens[i+1].get()['type']
+            i += 3 # skip (<type>)
+            parenDepth = 0
+            castValues = []
+            for tok in tokens[i:]:
+                if tok.get()['val'] == '(':
+                    parenDepth += 1
+                elif tok.get()['val'] == ')':
+                    parenDepth -= 1
+                if tok.get()['type'] in OPERATORS and parenDepth == 0: # Has ended
+                    break 
+                elif tok.get()['val'] == ';':
+                    if parenDepth > 0:
+                        raise SyntaxError(f'Could not resolved {parenDepth} parenthesis in the casting expression')
+                    break
+                castValues.append(tok)
+            castValue = Expression.evaluate(me, me.getArgs(), castValues)
+            finalCastValue = convertValue(castValue, parseTokenAsType(castToType))
+            out.append(finalCastValue)
         elif t == 'IDENTIFIER' and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'LBRACKET':
             array_name = tokens[i].get()['val']
             close_idx = matchingBracket(tokens, i + 1)
@@ -1201,11 +1221,33 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
             out.append(Token.wrap(element))
             i = close_idx + 1
             continue
+        elif t == 'IDENTIFIER' and i + 1 < len(tokens) and tokens[i+1].get()['type'] == 'LPAREN': # Simple call
+            # <id> (<args>)<;?>
+            methodName = tokens[i].get()['val']
+            i += 2 # skip method name, skip '('
+            argsList = []
+            thisExpr: list = []
+            for tok in tokens[i:]:
+                if tok.get()['val'] == ',':
+                    argsList.append(Expression.evaluate(me, methodArgs, thisExpr))
+                    thisExpr = []
+                    i += 1
+                    continue
+                thisExpr.append(tok)
+                i += 1
+            if methodName not in staticMethods.get(me.class_name, {}):
+                raise RuntimeError(f'Cannot invoke a non-static method {methodName} in a static context')
+            out.append(Token.wrap(invokeMethod(me.class_name, methodName, argsList, caller=me.class_name)))
+            continue
         elif t == 'IDENTIFIER':
-            if me is None:
-                raise RuntimeError(f"Cannot resolve '{tokens[i].get()['val']}' in this context (no active method call, e.g. inside a field initializer)")
-            out.append(Token.wrap(resolveValue(me, methodArgs, tokens[i])))
-            i += 1
+            if i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'LPAREN':
+                out.append(tokens[i])
+                i += 1
+            else:
+                if me is None:
+                    raise RuntimeError(f"Cannot resolve '{tokens[i].get()['val']}' in this context")
+                out.append(Token.wrap(resolveValue(me, methodArgs, tokens[i])))
+                i += 1
         elif t == 'THIS':
             if me is None or me.this is None:
                 raise RuntimeError("Cannot use 'this' in static context")
@@ -2087,7 +2129,7 @@ class Method:
         elif tok_type == 'NATIVE_PRINT_STMT':
             value = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(2), ')'))
             print(value.get())
-
+        
         self.tokPosition += 1
         return False
     def execute(self):
