@@ -460,7 +460,7 @@ class ArrayAssignment:
             raise SyntaxError("Expected ';' after array declaration")
         pos += 1
         # rhs: new <type> [] <START_DELC?> ...
-        #                         ^ Check here  
+        #                         ^ Check here
         if rhs_tokens[4].get()['val'] == '{': # Initialize?
             values = []
             thisElementExpr = []
@@ -1099,6 +1099,11 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
             className = current
         elif isinstance(current, ObjectReference):
             className = current.getClass()
+        elif isinstance(current, PrimitiveArray):
+            if memberName == 'length':
+                current = Int(current.size)
+                j += 2
+                continue
         else:
             raise RuntimeError(f"Cannot access '.{memberName}' on non-object value: {current!r}")
         callerClass = me.class_name if me is not None else className
@@ -1657,7 +1662,7 @@ class Method:
             if not updated:
                 raise RuntimeError(f"Cannot find variable '{var_name}' to increment/decrement")
             return False
-        elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.peek().get()['type'] == 'DOT': # Dot expr
+        elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.next(getType='type') == 'DOT': # Dot expr
             obj_token = token
             obj_name = tok_val
             self.tokPosition += 2
@@ -1669,6 +1674,12 @@ class Method:
             if member_token.get()['type'] != 'IDENTIFIER':
                 raise SyntaxError(f"Expected identifier after '.', got {member_token.get()['type']}")
             member_name = member_token.get()['val']
+            if member_name == 'length' and self.next() not in ['(', ')']: # arr.length
+                target = resolveValue(self.me, self.args, obj_token)
+                if not isinstance(target, PrimitiveArray):
+                    pass # not a primitive array 
+                return target.size
+
             self.tokPosition += 1  # skip member name
             
             if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'LPAREN':
