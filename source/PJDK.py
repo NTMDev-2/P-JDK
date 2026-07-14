@@ -23,10 +23,9 @@ class Numeric:
 class Returnable: # Base class in class hierachy for anything that a method could return
     pass
 
-
 def toSigned(value: int, bits: int) -> int:
     mask = (1 << bits) - 1
-    if isinstance(value, Int):
+    if isinstance(value, (Byte, Short, Int, Long, Double, Float)):
         value = value.get()
     value = int(value)
     value &= mask
@@ -1047,8 +1046,6 @@ def toRPN(tokens: TokenSlice) -> TokenSlice:
             opStack.append(tok)
             continue
         raise SyntaxError(f'Unexpected token in expression: {t} ({tok.get()["val"]})')
-    
-    # Pop remaining operators
     while opStack:
         top = opStack.pop()
         if top.get()['type'] in ('LPAREN', 'RPAREN'):
@@ -1113,6 +1110,7 @@ def matchingBrace(tokens: TokenSlice, openIdx: int) -> int:
         j += 1
     raise SyntaxError("Unmatched '{' in array initializer")
 
+
 def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: TokenSlice, startIdx: int):
     leftToken = tokens[startIdx]
     leftName = leftToken.get()['val']
@@ -1121,6 +1119,8 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
         if me is None or me.this is None:
             raise RuntimeError("Cannot use 'this' in static context")
         current = me.this
+    elif leftName == 'super':
+        current = getSuperOfClass(me.class_name)
     elif leftName in memory:
         current = leftName
     else:
@@ -1220,7 +1220,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                 out.append(Token.wrap(newObject(className)))
                 i = closeIdx + 1
                 continue
-        elif t in ('IDENTIFIER', 'THIS') and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'DOT': # Complex call
+        elif t in ('IDENTIFIER', 'THIS', 'SUPER') and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'DOT': # Complex call
             resolved, nextIdx = resolveDotChain(me, methodArgs, tokens, i)
             out.append(Token.wrap(resolved))
             i = nextIdx
@@ -1557,6 +1557,10 @@ def perspectiveOfClass(_class: str, _relativeToClass: str) -> str:
         return 'subclass'
     
     return 'other'
+def getSuperOfClass(class_name: str) -> str:
+    h = getHierarchyOfClass(class_name)
+    return list(h.keys())[1]
+
 class Return:
     @staticmethod
     def ret(me: StackFrame, methodArgs: list, valueByToken: TokenSlice):
@@ -1667,7 +1671,7 @@ class Method:
     def executeLine(self):
         if self.tokPosition >= len(self.lang):
             return False
-
+        
         token = self.lang[self.tokPosition]
         tok_type = token.get()['type']
         tok_val = token.get()['val']
@@ -1684,6 +1688,8 @@ class Method:
             parseBy = 1 if isUnsignedType else 0
             var_name = self.next()
             self.tokPosition += 1 + parseBy
+            if var_name in self.me.locals:
+                raise NameError(f'The variable \'{var_name}\' was already declared in this context')
             if self.next(1+parseBy) == '=':
                 assignToClass = ClassReference(tok_val) if isClassAssign else None
                 LocalAssignment.assign(self.me, self.args, [tok_val, var_name, isUnsignedType], self.read(self.peek(2+parseBy), ';'), assignToClass)
@@ -1747,7 +1753,7 @@ class Method:
             if not updated:
                 raise RuntimeError(f"Cannot find variable '{var_name}' to increment/decrement")
             return False
-        elif (tok_type == 'IDENTIFIER' or tok_type == 'THIS') and self.next(getType='type') == 'DOT': # Dot expr
+        elif (tok_type == 'IDENTIFIER' or tok_type in ['THIS', 'SUPER']) and self.next(getType='type') == 'DOT': # Dot expr
             obj_token = token
             obj_name = tok_val
             self.tokPosition += 2
@@ -1779,6 +1785,13 @@ class Method:
                     target = self.me.this
                     if target is None:
                         raise RuntimeError("Cannot use 'this' in static context")
+                elif obj_name == 'super':
+                    target = self.me.this
+                    if target is None:
+                        raise RuntimeError("Cannot use 'super' in static context")
+                    target_class = target.getClass()
+                    # For super calls, start lookup from the superclass
+                    start_class = memory[self.me.class_name]['super'].getClass()
                 elif obj_name in memory:
                     # Static method call: ClassName.method()
                     target_class = obj_name
@@ -1788,7 +1801,10 @@ class Method:
                     if not isinstance(target, ObjectReference):
                         raise RuntimeError(f"'{obj_name}' is not an object reference")
                     target_class = target.getClass()
-                
+                try:
+                    start_class
+                except UnboundLocalError:
+                    start_class = None
                 if obj_name in memory:
                     # Static
                     if member_name not in memory[obj_name]['methods']:
@@ -1809,14 +1825,13 @@ class Method:
                         member_name,
                         evaledArgs,
                         caller=self.me.class_name,
-                        thisRef=target
+                        thisRef=target,
+                        startClass = start_class
                     )
-                
                 self.tokPosition = closeIdx + 1
                 if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
                     self.tokPosition += 1
                 return False
-            
             else:
                 if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'ASSIGN':
                     #obj.field = value
@@ -1911,7 +1926,7 @@ class Method:
                     # ???
                     self.tokPosition += 1
                     return False
-        elif tok_type == 'IDENTIFIER' and self.peek().get()['type'] == 'ASSIGN': # Simple assignment
+        elif tok_type == 'IDENTIFIER' and self.peek().get()['type'] == 'ASSIGN' and self.before(2, getType='type') not in RETURN_TYPES: # Simple assignment
             var_name = tok_val
             self.tokPosition += 2 
 
@@ -1926,7 +1941,6 @@ class Method:
             
             new_value = Expression.evaluate(self.me, self.args, rhs_tokens)
             updated = False
-            
             # Local
             try:
                 self.me.changeLocal(var_name, new_value)
@@ -2314,10 +2328,11 @@ class Execution:
                 if self.next(by=1) != 'extends':  # Check the next token after class name
                     createClass(class_name, modifier)
                 else:
+                    if self.info.get('hasSuper', False):
+                        raise NameError(f'Class {class_name} cannot have multiple parent classes')
                     self.tokPosition += 1  # skip 'extends'
                     super_name = self.next()  # get superclass name
                     createClass(class_name, modifier, ClassReference(super_name))
-                
                 self.currentClass = class_name
                 self.clear()
                 self.info['isInClass'] = True
@@ -2521,14 +2536,41 @@ class Execution:
         methodBody = self.langParse.getSource()[startArgRead:endArgRead]
         memory[self.currentClass]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
         self.tokPosition = closeIndex - 1
-def invokeMethod(className: str, methodName: str, args: list, caller: str, thisRef: 'ObjectReference | None' = None) -> Returnable:
-    if className not in memory:
-        raise NameError(f"Class '{className}' is not defined")
-    if methodName not in memory[className]['methods']:
-        raise NameError(f"Method '{methodName}' is not defined in class '{className}'")
+def invokeMethod(className: str, methodName: str, args: list, caller: str, thisRef: 'ObjectReference | None' = None, startClass: str | None = None) -> Returnable:
+    if startClass is not None:
+        lookup_class = startClass
+    else:
+        lookup_class = className
+    found_method = None
+    found_class = None
+    
+    current = lookup_class
+    while current is not None:
+        if current in memory and methodName in memory[current]['methods']:
+            found_method = memory[current]['methods'][methodName]
+            found_class = current
+            break
+        if current in memory and 'super' in memory[current]:
+            current = memory[current]['super'].getClass()
+        else:
+            current = None
+    
+    if found_method is None:
+        raise NameError(f"Method '{methodName}' not found in class hierarchy starting from '{lookup_class}'")
+    
+    if found_method.get('static', False):
+        if thisRef is not None:
+            print(f"[WARNING] Static method {methodName} called with instance reference")
+        thisRef = None
+    else:
+        if thisRef is None:
+            if callStack and callStack[-1].this is not None:
+                thisRef = callStack[-1].this
+            else:
+                raise RuntimeError(f"Cannot call instance method '{methodName}' without 'this' reference")
     mInfo = memory[className]['methods'][methodName]
     mArgTypes = list(mInfo['args'].values())
-    for mArgId in range(len(mArgTypes)): # Verify if argument type matches actual given type
+    for mArgId in range(len(mArgTypes)):
         isConsistentTypes(args[mArgId], mArgTypes[mArgId])
     pushFrame(methodName, className, thisRef or newObject(className), args)
 
@@ -2568,5 +2610,6 @@ while choice == 'Retry':
     choice = 'Retry' if not input('\n[ENTER]: Reload file [OTHER+ENTER]: Exit console') else ''
     if choice == 'Retry':
         Exec.reset()
+    
     os.system('cls')
     oldContent = content
