@@ -1027,7 +1027,6 @@ def toRPN(tokens: TokenSlice) -> TokenSlice:
         if t == 'LPAREN':
             opStack.append(tok)
             continue
-        
         if t == 'RPAREN':
             while opStack and opStack[-1].get()['type'] != 'LPAREN':
                 output.append(opStack.pop())
@@ -1035,7 +1034,6 @@ def toRPN(tokens: TokenSlice) -> TokenSlice:
                 raise SyntaxError('Mismatched parentheses')
             opStack.pop()
             continue
-        
         if t == 'MINUS':
             is_unary = (i == 0) or (tokens[i-1].get()['type'] in 
                 ('LPAREN', 'PLUS', 'MINUS', 'MULTIPLY', 'DIVIDE', 'MODULO',
@@ -1123,7 +1121,6 @@ def matchingBrace(tokens: TokenSlice, openIdx: int) -> int:
         j += 1
     raise SyntaxError("Unmatched '{' in array initializer")
 
-
 def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: TokenSlice, startIdx: int):
     leftToken = tokens[startIdx]
     leftName = leftToken.get()['val']
@@ -1133,7 +1130,14 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
             raise RuntimeError("Cannot use 'this' in static context")
         current = me.this
     elif leftName == 'super':
-        current = getSuperOfClass(me.class_name)
+        # super refers to the superclass of the current class
+        # We need to keep track that this is a super reference
+        # and resolve fields through the superclass
+        if me is None or me.this is None:
+            raise RuntimeError("Cannot use 'super' in static context")
+        current = me.this
+        # Store the superclass name separately for field resolution
+        superclass_name = getSuperOfClass(me.class_name)
     elif leftName in memory:
         current = leftName
     else:
@@ -1157,7 +1161,12 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                 continue
         else:
             raise RuntimeError(f"Cannot access '.{memberName}' on non-object value: {current!r}")
+        
+        # Determine the caller class for permission checks
         callerClass = me.class_name if me is not None else className
+
+        # Check if we're resolving a super field
+        is_super_access = (leftName == 'super' and j == startIdx + 1)
 
         if isCall:
             openParenIdx = j + 2
@@ -1165,7 +1174,13 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
             argGroups = Token.splitArgs(tokens[openParenIdx + 1 : closeIdx])
             evaledArgs = [Expression.evaluate(me, methodArgs, g) for g in argGroups]
             thisRef = current if isinstance(current, ObjectReference) else None
-            current = invokeMethod(className, memberName, evaledArgs, caller=callerClass, thisRef=thisRef)
+            
+            if is_super_access:
+                start_class = superclass_name
+            else:
+                start_class = None
+            
+            current = invokeMethod(className, memberName, evaledArgs, caller=callerClass, thisRef=thisRef, startClass=start_class)
             j = closeIdx + 1
         else:
             if isinstance(current, str):
@@ -1176,8 +1191,13 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                 else:
                     raise RuntimeError(f"Static field '{memberName}' not found in class '{className}'")
             else:
-                thisScope = perspectiveOfClass(callerClass, className)
-                isAllowedAtThisScope(memory[className]['fields'][memberName]['modifier'], thisScope)
+                if is_super_access:
+                    field_class = superclass_name
+                else:
+                    field_class = className
+                
+                thisScope = perspectiveOfClass(callerClass, field_class)
+                isAllowedAtThisScope(memory[field_class]['fields'][memberName]['modifier'], thisScope)
                 current = current.get().fields.get(memberName, Null())
             j += 2
 
@@ -1860,10 +1880,10 @@ class Method:
                     new_value = Expression.evaluate(self.me, self.args, rhs_tokens)
                     
                     # Resolve
-                    if obj_name == 'this':
+                    if obj_name in ('this', 'super'):
                         target = self.me.this
                         if target is None:
-                            raise RuntimeError("Cannot use 'this' in static context")
+                            raise RuntimeError(f"Cannot use '{obj_name}' in static context")
                     elif obj_name in memory:
                         # Static
                         if obj_name not in staticVariables or member_name not in staticVariables[obj_name]:
@@ -1903,10 +1923,10 @@ class Method:
                     else:
                         raise SyntaxError("Expected ';' after increment/decrement expression")
 
-                    if obj_name == 'this':
+                    if obj_name in ('this', 'super'):
                         target = self.me.this
                         if target is None:
-                            raise RuntimeError("Cannot use 'this' in static context")
+                            raise RuntimeError(f"Cannot use '{obj_name}' in static context")
                         instance = target.get()
                         if member_name not in instance.fields:
                             raise RuntimeError(f"Field '{member_name}' not found on object")
@@ -2673,7 +2693,10 @@ while choice == 'Retry':
     try:
         Exec = Execution(Intepreter(content))
         Exec.executeTokens()
-        invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+        try:
+            invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, [], caller=ENTRY['entryClass'])
+        except NameError:
+            raise NameError(f'Could not resolve the entry method "{ENTRY_METHOD_NAME}". Please define it properly')
     except Exception as e:
         for line in traceback.format_exception(e)[1:-1]:
             print(line.strip())
