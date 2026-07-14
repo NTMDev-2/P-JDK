@@ -592,7 +592,8 @@ class EvalTokens():
         "double": "DOUBLE_TYPE",
         "float": "FLOAT_TYPE",
 
-        "println": "NATIVE_PRINT_STMT", 
+        "println": "NATIVE_PRINT_STMT",
+        "print": "NATIVE_PRINT_STMT_nline", 
         
         "=": "ASSIGN",
         "+": "PLUS",
@@ -2251,10 +2252,13 @@ class Method:
                 raise RuntimeError(f"'{tok_type}' outside of loop")
             
             return tok_type.lower()  # 'break' or 'continue'
-        elif tok_type == 'NATIVE_PRINT_STMT':
+        if tok_type == 'NATIVE_PRINT_STMT':
             value = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(2), ')'))
             print(value.get())
-        
+        if tok_type == 'NATIVE_PRINT_STMT_nline':
+            value = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(2), ')'))
+            print(value.get(),end="")
+            
         self.tokPosition += 1
         return False
     def execute(self):
