@@ -2318,7 +2318,7 @@ class Execution:
                     super_name = self.next()  # get superclass name
                     createClass(class_name, modifier, ClassReference(super_name))
                 
-                self.currentClass = class_name  # ✅ Set to the stored class name, not self.next()
+                self.currentClass = class_name
                 self.clear()
                 self.info['isInClass'] = True
             elif tok_type == EvalTokens.TOKENS['final']: # Sets final
