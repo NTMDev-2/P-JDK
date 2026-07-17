@@ -232,7 +232,7 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
         'methods': inherited,
         'fields': inherited_fields
     }
-def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool = False, methodArgs: dict = {}): # methodReturnType = Void, Byte, Short, Int, Long, String, ClassReference
+def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool = False, methodArgs: dict = {}, throws: list = []): # methodReturnType = Void, Byte, Short, Int, Long, String, ClassReference
     isValidReturnType(methodReturnType)
     isValidModifier(methodModifier)
     classInfo = memory[thisClass.getClass()]
@@ -241,7 +241,8 @@ def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str
         'modifier': methodModifier,
         'returns': methodReturnType,
         'static': isStatic,
-        'args': methodArgs
+        'args': methodArgs,
+        'throws': throws
     }
     if isStatic:
         staticMethods[methodName] = {
@@ -587,6 +588,8 @@ class EvalTokens():
         "false": "FALSE",
         "this": "THIS",
         "super": "SUPER",
+        'throw': 'THROW_EXPR', # throw new Exception,
+        'throws': 'THROW_STMT', # method A throws Exception
         
         "byte": "BYTE_TYPE",
         "short": "SHORT_TYPE",
@@ -2710,15 +2713,16 @@ class Execution:
                     self.mode = ['is_active_method_def', 'arg_def'] # Must specify "is_active_method_def" because it is method definition, not method call
                     # Will use "is_active_method_call" for method calls
                     args = argsList(self.handleArgumentDefinition(token)) # This reads the argument definition
+                    checkedExecs = self.handleThrowStmt(token, len(list(args.keys())))
                     del self.info['thisMethodArgs'] # Clear the argument definition memory
                     parseby = 1 if self.states['STATIC'] else 0
                     parseby += 1 if self.states['UNSIGNED'] else 0
                     methodReturnType = parseTokenAsType(self.before(by=2), True, self.states['UNSIGNED'])
                     if methodReturnType is ClassType:
                         # Must specify exact class if the method is to return one.
-                        self.handleMethodDefinition(self.before(), self.before(by=3+parseby), ClassType(self.before(by=2)), self.states['STATIC'], args)
+                        self.handleMethodDefinition(self.before(), self.before(by=3+parseby), ClassType(self.before(by=2)), self.states['STATIC'], args, checkedExecs)
                     else:
-                        self.handleMethodDefinition(self.before(), self.before(by=3+parseby), methodReturnType, self.states['STATIC'], args)
+                        self.handleMethodDefinition(self.before(), self.before(by=3+parseby), methodReturnType, self.states['STATIC'], args, checkedExecs)
                     self.info['thisMethodName'] = self.before()
                     if self.info.get('thisMethodName') == ENTRY_METHOD_NAME:
                         if self.before(by=3+parseby) != 'public':
@@ -2765,11 +2769,31 @@ class Execution:
                 else:
                     raise RuntimeError(f'Could not resolve the argument stream: {argReader}')
             self.info['thisMethodArgs'][arg_name] = arg_type # Do not set into self.argumentStack
+
         return self.info['thisMethodArgs']
+    def handleThrowStmt(self, currentToken: Token, argSize: int): # <method_name> (<args>) throws? <exceptions...>
+        argSize = len(self.read(currentToken, ')')) + 1
+        startRead = self.tokPosition + argSize
+        endRead = self.tokPosition + len(self.read(currentToken, '{'))
+        parsed_as_str = [a.get()['val'] for a in self.lang[startRead:endRead]]
+        if len(parsed_as_str) > 0 and parsed_as_str[0] != 'throws':
+            raise SyntaxError('Expected \'throws\' statement to start Exception list')
+        exceptions = []
+        for token in self.lang[startRead+1:endRead]: # Skip the 'throws'
+            if token.get()['val'] == ',':
+                continue
+            exceptions.append(token.get()['val'])
+        parsed = []
+        for e in exceptions:
+            thisExec = getattr(__builtins__, e, object)
+            if not issubclass(thisExec, (Exception, Warning)):
+                raise NameError(f'Invalid exception "{e}"')
+            parsed.append(thisExec)
+        return parsed
     def handleNullFieldDefinition(self, _type: object, modifier: str):
         setField(ClassReference(self.currentClass), self.next(), modifier, _type, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
-    def handleMethodDefinition(self, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool, methodArgs: dict):
-        createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, isStatic, argsList(methodArgs))
+    def handleMethodDefinition(self, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool, methodArgs: dict, throws: list = []):
+        createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, isStatic, argsList(methodArgs), throws)
         self.clear(noClearMode=True, noClearInfo=True)
     def clear(self, noClearMode: bool = False, noClearArgStack: bool = False, noClearInfo: bool = False):
         if not noClearMode:
