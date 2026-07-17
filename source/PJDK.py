@@ -15,6 +15,7 @@ nextHeapId = 0
 heap: dict = {}
 
 memory: dict = {'Object': {'name': 'Object'}}
+interfaces: dict = {}
 
 class Numeric:
     @classmethod
@@ -166,9 +167,14 @@ class ClassType(Returnable):
 def isAllowedAtThisScope(modifier: str, thisScope: str) -> bool: 
     isValidModifier(modifier)
     if thisScope == "this":
-        return
-    if (thisScope == "subclass" or thisScope == "other") and modifier == "public":
-        return
+        return True
+    if modifier == "public":
+        return True
+    if modifier == "protected" and thisScope == "subclass":
+        return True
+    # 'private' and 'default' (no package system exists in this language, so
+    # 'default'/package-private collapses to "this class only", same as 'private')
+    # are only accessible from thisScope == "this", which was already handled above.
     raise PermissionError('Attempted to access a field or method without sufficient permission')
 def isConsistentTypes(thisType: object, otherType: object) -> bool:
     if isinstance(thisType, ClassType) or thisType is ClassType or thisType is ClassReference:
@@ -284,7 +290,7 @@ def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str):
                 return True
         return False
 
-    # --- Map declared parameter names to class names, for resolving paramName.method() calls ---
+    # Map declared parameter names to class names, for resolving paramName.method() calls
     paramClassMap = {}
     for argName, argType in methodInfo.get('args', {}).items():
         if isinstance(argType, ClassReference):
@@ -388,6 +394,35 @@ def argsList(args: dict[str, object]) -> dict: # This sets and compiles an argum
         if issubclass(type(expectedType), Numeric) or isinstance(expectedType, (Void, String)):
             continue
     return args
+
+def createInterface(interfaceName: str):
+    if interfaceName in interfaces:
+        raise NameError(f'Interface {interfaceName} is already defined')
+    interfaces[interfaceName] = {
+        'name': interfaceName,
+        'methods': {},
+    }
+def setInterfaceField(interfaceName: str, fieldName: str, fieldType: object, initialValue: object = None):
+    if interfaceName not in interfaces:
+        raise NameError(f"Interface '{interfaceName}' does not exist")
+    
+    if initialValue is not None:
+        converted_value = convertValue(initialValue, fieldType)
+    else:
+        converted_value = default_value_for_type(fieldType)
+    
+    if interfaceName not in staticVariables:
+        staticVariables[interfaceName] = {}
+    
+    staticVariables[interfaceName][fieldName] = {
+        'class': interfaceName,
+        'name': fieldName,
+        'modifier': 'public',
+        'type': fieldType,
+        'value': converted_value,
+        'final': True,
+        'isInterface': True
+    }
 
 def default_value_for_type(typ: object) -> object:
     if typ is Byte or typ is UnsignedByte:
@@ -534,6 +569,7 @@ def newPrimitiveArray(element_type: object, size: int, initial_values: list | No
         while len(initial_values) < size:
             initial_values.append(default)
     return PrimitiveArray(size, initial_values, element_type)
+
 TokenSlice = list['Token']
 class PrimitiveArray(Returnable):
     def __init__(self, size: int, initialValues: list, listType: object):
@@ -1730,8 +1766,12 @@ def getHierarchyOfClass(class_name: str) -> dict[str, dict]:
 def perspectiveOfClass(_class: str, _relativeToClass: str) -> str:
     if _class == _relativeToClass:
         return 'this'
-    hierarchy = getHierarchyOfClass(_relativeToClass)
-    if _class in hierarchy:
+    # _class is the caller; _relativeToClass is the class that owns the member
+    # being accessed. The caller counts as a "subclass" for protected-access
+    # purposes only if the owning class is one of the caller's ancestors
+    # (i.e. the caller extends, directly or transitively, the owning class).
+    hierarchy = getHierarchyOfClass(_class)
+    if _relativeToClass in hierarchy:
         return 'subclass'
     
     return 'other'
@@ -1744,7 +1784,6 @@ def isClass(class_name: str) -> bool:
         return True
     except Exception:
         return False
-
 
 class Return:
     @staticmethod
@@ -1873,7 +1912,6 @@ class Method:
                     break
             self.tokPosition += 1
     def scanBlock(self, openPos: int) -> tuple[int, int]:
-        # Reads entire block 
         if openPos >= len(self.lang) or self.lang[openPos].get()['type'] != 'START_DECLARATION':
             raise SyntaxError("Expected '{'")
         depth = 1
@@ -2779,7 +2817,15 @@ class Execution:
                 prev_token = self.lang[self.tokPosition - 1]
                 if prev_token.get()['type'] == 'NEW':
                     is_constructor_call = True
-            
+                
+            if self.currentClass and not self.info.get('isInMethod', False) and 'field_def' not in self.mode: # Applies context based on 'default'
+                if tok_type in RETURN_TYPES or (tok_type == 'IDENTIFIER' and tok_val in memory):
+                    next_token = self.peek(1) if self.tokPosition + 1 < len(self.lang) else None
+                    next_next_token = self.peek(2) if self.tokPosition + 2 < len(self.lang) else None
+                    
+                    if next_token and next_token.get()['type'] == 'IDENTIFIER':
+                        if next_next_token and next_next_token.get()['type'] in ('ASSIGN', 'SEMICOLON', 'LBRACKET'):
+                            self.mode.append('field_def')
             if tok_type == EvalTokens.TOKENS['(']:
                 self.info['parenStack'] = self.info.get('parenStack', 0) + 1
             if tok_type == 'EOF':
@@ -2886,7 +2932,6 @@ class Execution:
             elif tok_type in ACCESS_MODIFIERS: # Applies context: 'method_def', 'field_def'
                 self.mode.extend(['method_def', 'field_def'])
             elif tok_type in RETURN_TYPES and 'field_def' in self.mode: # FIELD
-                # Look backwards
                 modifier = 'default'
                 i = self.tokPosition - 1
                 while i >= 0:
@@ -2896,8 +2941,8 @@ class Execution:
                     if t.get()['type'] in ACCESS_MODIFIERS or t.get()['val'] in ['public', 'private', 'protected', 'default']:
                         modifier = t.get()['val']
                         break
+                    
                     i -= 1
-                
                 if self.next(by=2) == '=': # Looks like: <modifier> int <id> = <value>;
                     self.mode = []
                     if tok_type == 'TRUE' or tok_type == 'FALSE' or tok_type == 'BOOLEAN_TYPE':
