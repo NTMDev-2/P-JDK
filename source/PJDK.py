@@ -198,6 +198,133 @@ def isConsistentTypes(thisType: object, otherType: object) -> bool:
         raise Exception(f'Type {otherType.__name__} does not support type {thisType.__name__}')
     
     raise Exception(f'Type {otherType.__name__} does not support type {thisType.__name__}')
+def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str):
+    """
+    Static (parse-time) check: for every call inside <thisMethodName>'s body to another
+    method that declares exceptions in its own 'throws' clause, verify that this method
+    either (a) declares that same exception (or a supertype of it) in its own 'throws'
+    clause, or (b) wraps the call in a try/catch that catches that exception (or a
+    supertype). Raises SyntaxError if a thrown exception is neither caught nor declared.
+
+    Note: this DSL has no built-in notion of "unchecked" exceptions (there's no clean
+    equivalent of Java's RuntimeException umbrella over Python's builtin exception
+    classes), so every exception listed in a method's 'throws' clause is treated as
+    checked and must be handled by callers.
+
+    This is a best-effort static check, not a full compiler pass: it can only resolve
+    calls that are statically determinable from the source text -- unqualified calls
+    (own class / inherited), this.method(...), super.method(...),
+    ClassName.staticMethod(...), and calls on a method parameter whose declared type is
+    a known class. Calls made through local variables, chained calls, or other classes
+    defined later in the file (forward references) are not tracked and are silently
+    skipped rather than raising a false positive.
+    """
+    ownerThrows = memory[ownerName]['methods'][thisMethodName].get('throws', [])
+    methodInfo = memory[ownerName]['methods'][thisMethodName]
+    body = methodInfo.get('body')
+    if not body:
+        return
+
+    bodyParser = Intepreter(body)
+    bodyParser.parse()
+    tokens = bodyParser.get()
+
+    # --- Pass 1: find try-block ranges and the exception types their catch clauses cover ---
+    protectedRanges = []  # list of (start, end, set_of_types)
+    i = 0
+    while i < len(tokens):
+        if tokens[i].get()['type'] == 'TRY':
+            j = i + 1
+            if j >= len(tokens) or tokens[j].get()['type'] != 'START_DECLARATION':
+                i += 1
+                continue
+            depth = 1
+            scan = j + 1
+            tryStart = scan
+            while scan < len(tokens) and depth > 0:
+                t = tokens[scan].get()['type']
+                if t == 'START_DECLARATION':
+                    depth += 1
+                elif t == 'END_DECLARATION':
+                    depth -= 1
+                scan += 1
+            tryEnd = scan  # index right after the matching '}'
+            coveredTypes = set()
+            while scan < len(tokens) and tokens[scan].get()['type'] == 'CATCH':
+                scan += 1
+                if scan < len(tokens) and tokens[scan].get()['type'] == 'LPAREN':
+                    scan += 1
+                if scan < len(tokens) and tokens[scan].get()['type'] == 'IDENTIFIER':
+                    excName = tokens[scan].get()['val']
+                    excType = getattr(__builtins__, excName, object)
+                    if isinstance(excType, type) and issubclass(excType, (Exception, Warning)):
+                        coveredTypes.add(excType)
+                    scan += 1
+                while scan < len(tokens) and tokens[scan].get()['type'] != 'RPAREN':
+                    scan += 1
+                scan += 1  # past ')'
+                if scan < len(tokens) and tokens[scan].get()['type'] == 'START_DECLARATION':
+                    cdepth = 1
+                    scan += 1
+                    while scan < len(tokens) and cdepth > 0:
+                        t2 = tokens[scan].get()['type']
+                        if t2 == 'START_DECLARATION':
+                            cdepth += 1
+                        elif t2 == 'END_DECLARATION':
+                            cdepth -= 1
+                        scan += 1
+            protectedRanges.append((tryStart, tryEnd, coveredTypes))
+            i = tryStart
+            continue
+        i += 1
+
+    def isProtectedAt(pos, excType):
+        for (start, end, types) in protectedRanges:
+            if start <= pos < end and any(issubclass(excType, t) for t in types):
+                return True
+        return False
+
+    # --- Map declared parameter names to class names, for resolving paramName.method() calls ---
+    paramClassMap = {}
+    for argName, argType in methodInfo.get('args', {}).items():
+        if isinstance(argType, ClassReference):
+            paramClassMap[argName] = argType.getClass()
+
+    def resolveCall(idx):
+        """Best-effort resolution of a call starting at tokens[idx]. Returns (className, methodName) or (None, None)."""
+        t0 = tokens[idx].get()
+        if t0['type'] == 'IDENTIFIER' and idx + 1 < len(tokens) and tokens[idx + 1].get()['type'] == 'LPAREN':
+            return ownerName, t0['val']
+        if t0['type'] == 'THIS' and idx + 3 < len(tokens) and tokens[idx + 1].get()['type'] == 'DOT' and tokens[idx + 3].get()['type'] == 'LPAREN':
+            return ownerName, tokens[idx + 2].get()['val']
+        if t0['type'] == 'SUPER' and idx + 3 < len(tokens) and tokens[idx + 1].get()['type'] == 'DOT' and tokens[idx + 3].get()['type'] == 'LPAREN':
+            superRef = memory.get(ownerName, {}).get('super')
+            return (superRef.getClass() if superRef else None), tokens[idx + 2].get()['val']
+        if t0['type'] == 'IDENTIFIER' and idx + 3 < len(tokens) and tokens[idx + 1].get()['type'] == 'DOT' and tokens[idx + 3].get()['type'] == 'LPAREN':
+            qualifier = t0['val']
+            methodName = tokens[idx + 2].get()['val']
+            if qualifier in memory:
+                return qualifier, methodName
+            if qualifier in paramClassMap:
+                return paramClassMap[qualifier], methodName
+        return None, None
+
+    for idx in range(len(tokens)):
+        className, methodName = resolveCall(idx)
+        if className is None or className not in memory:
+            continue
+        calleeInfo = memory[className]['methods'].get(methodName)
+        if not calleeInfo:
+            continue
+        for excType in calleeInfo.get('throws', []):
+            if isProtectedAt(idx, excType):
+                continue
+            if any(issubclass(excType, declared) for declared in ownerThrows):
+                continue
+            raise SyntaxError(
+                f"Unreported exception {excType.__name__}; must be caught or declared to be thrown "
+                f"in method '{thisMethodName}' of class '{ownerName}' (thrown by '{className}.{methodName}')"
+            )
 def isValidModifier(modifier: str):
     if not (modifier == 'private' or modifier == 'public' or modifier == 'protected' or modifier == 'default'):
         raise Exception(f'The modifier provided was not either "private" or "public", was "{modifier}"')
@@ -590,6 +717,9 @@ class EvalTokens():
         "super": "SUPER",
         'throw': 'THROW_EXPR', # throw new Exception,
         'throws': 'THROW_STMT', # method A throws Exception
+        'try': 'TRY',
+        'catch': 'CATCH',
+        'finally': 'FINALLY',
         
         "byte": "BYTE_TYPE",
         "short": "SHORT_TYPE",
@@ -1140,12 +1270,9 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
         current = me.this
     elif leftName == 'super':
         # super refers to the superclass of the current class
-        # We need to keep track that this is a super reference
-        # and resolve fields through the superclass
         if me is None or me.this is None:
             raise RuntimeError("Cannot use 'super' in static context")
         current = me.this
-        # Store the superclass name separately for field resolution
         superclass_name = getSuperOfClass(me.class_name)
     elif leftName in memory:
         current = leftName
@@ -1304,24 +1431,27 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
             out.append(Token.wrap(element))
             i = close_idx + 1
             continue
-        elif t == 'IDENTIFIER' and i + 1 < len(tokens) and tokens[i+1].get()['type'] == 'LPAREN': # Simple call
-            # <id> (<args>)<;?>
+                # In collapseTokenSlice, around line 1445-1455:
+        elif t == 'IDENTIFIER' and i + 1 < len(tokens) and tokens[i+1].get()['type'] == 'LPAREN':
             methodName = tokens[i].get()['val']
-            i += 2 # skip method name, skip '('
-            argsList = []
-            thisExpr: list = []
-            for tok in tokens[i:]:
-                if tok.get()['val'] == ',':
-                    argsList.append(Expression.evaluate(me, methodArgs, thisExpr))
+            if me is not None:
+                method_info = memory.get(me.class_name, {}).get('methods', {}).get(methodName)
+                if method_info and method_info.get('static', False):
+                    i += 2
+                    argsList = []
                     thisExpr = []
-                    i += 1
+                    for tok in tokens[i:]:
+                        if tok.get()['val'] in (',', ')'):
+                            argsList.append(Expression.evaluate(me, methodArgs, thisExpr))
+                            thisExpr = []
+                            i += 1
+                            continue
+                        thisExpr.append(tok)
+                        i += 1
+                    result = invokeMethod(me.class_name, methodName, argsList, caller=me.class_name)
+                    out.append(Token.wrap(result))
                     continue
-                thisExpr.append(tok)
-                i += 1
-            if methodName not in staticMethods.get(me.class_name, {}):
-                raise RuntimeError(f'Cannot invoke a non-static method {methodName} in a static context')
-            out.append(Token.wrap(invokeMethod(me.class_name, methodName, argsList, caller=me.class_name)))
-            continue
+            raise RuntimeError(f'Cannot invoke a non-static method {methodName} in a static context')
         elif t == 'IDENTIFIER':
             if i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'LPAREN':
                 out.append(tokens[i])
@@ -1672,6 +1802,25 @@ class Method:
             else:
                 break
         return self.lang[startRead:endRead]
+    def readUntilMatching(self, start_token: Token, open_char: str, close_char: str) -> TokenSlice: # Read nested characters
+        start_idx = self.lang.index(start_token)
+        end_idx = start_idx
+        depth = 0
+        started = False
+        
+        for i, tok in enumerate(self.lang[start_idx:], start=start_idx):
+            val = tok.get()['val']
+            if val == open_char:
+                depth += 1
+                started = True
+            elif val == close_char:
+                depth -= 1
+                if depth == 0 and started:
+                    end_idx = i + 1
+                    break
+            end_idx = i + 1
+        
+        return self.lang[start_idx:end_idx]
     def before(self, by: int = 1, getType: str = 'val') -> str:
         try:
             return self.lang[self.tokPosition - by].get()[getType]
@@ -1723,6 +1872,22 @@ class Method:
                     self.tokPosition += 1  # skip the '}'
                     break
             self.tokPosition += 1
+    def scanBlock(self, openPos: int) -> tuple[int, int]:
+        # Reads entire block 
+        if openPos >= len(self.lang) or self.lang[openPos].get()['type'] != 'START_DECLARATION':
+            raise SyntaxError("Expected '{'")
+        depth = 1
+        scan = openPos + 1
+        while scan < len(self.lang):
+            t = self.lang[scan].get()['type']
+            if t == 'START_DECLARATION':
+                depth += 1
+            elif t == 'END_DECLARATION':
+                depth -= 1
+                if depth == 0:
+                    return openPos + 1, scan + 1
+            scan += 1
+        raise SyntaxError("Unterminated block; expected '}'")
     def executeLine(self):
         if self.tokPosition >= len(self.lang):
             return False
@@ -2242,6 +2407,107 @@ class Method:
             self.isInLoop = False
             self.tokPosition = after_do_while_pos
             return False
+        elif tok_type == 'THROW_EXPR':
+            # throw new <ExceptionName>(<message?>);
+            self.tokPosition += 1
+            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'NEW':
+                raise SyntaxError("Expected 'new' after 'throw' (only 'throw new <Exception>(...);' is supported)")
+            self.tokPosition += 1
+            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'IDENTIFIER':
+                raise SyntaxError("Expected exception type name after 'throw new'")
+            excName = self.lang[self.tokPosition].get()['val']
+            excType = getattr(__builtins__, excName, object)
+            if not (isinstance(excType, type) and issubclass(excType, (Exception, Warning))):
+                raise NameError(f'Invalid exception "{excName}"')
+            self.tokPosition += 1
+            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'LPAREN':
+                raise SyntaxError("Expected '(' after exception type in 'throw'")
+            openParen = self.tokPosition
+            closeParen = matchingParen(self.lang, openParen)
+            msgTokens = self.lang[openParen + 1:closeParen]
+            message = ''
+            if msgTokens:
+                msgValue = Expression.evaluate(self.me, self.args, msgTokens)
+                message = str(msgValue.get()) if hasattr(msgValue, 'get') else str(msgValue)
+            self.tokPosition = closeParen + 1
+            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
+                raise SyntaxError("Expected ';' after throw statement")
+            self.tokPosition += 1
+            raise excType(message)
+        elif tok_type == 'TRY':
+            # try { <block> } (catch (<ExceptionType> <var>) { <block> })* (finally { <block> })?
+            self.tokPosition += 1
+            try_body_start, scan = self.scanBlock(self.tokPosition)
+
+            catch_clauses = []
+            while scan < len(self.lang) and self.lang[scan].get()['type'] == 'CATCH':
+                scan += 1
+                if scan >= len(self.lang) or self.lang[scan].get()['type'] != 'LPAREN':
+                    raise SyntaxError("Expected '(' after 'catch'")
+                scan += 1
+                if scan >= len(self.lang) or self.lang[scan].get()['type'] != 'IDENTIFIER':
+                    raise SyntaxError("Expected exception type in 'catch'")
+                excName = self.lang[scan].get()['val']
+                excType = getattr(__builtins__, excName, object)
+                if not (isinstance(excType, type) and issubclass(excType, (Exception, Warning))):
+                    raise NameError(f'Invalid exception type "{excName}" in catch clause')
+                scan += 1
+                if scan >= len(self.lang) or self.lang[scan].get()['type'] != 'IDENTIFIER':
+                    raise SyntaxError("Expected variable name in 'catch'")
+                varName = self.lang[scan].get()['val']
+                scan += 1
+                if scan >= len(self.lang) or self.lang[scan].get()['type'] != 'RPAREN':
+                    raise SyntaxError("Expected ')' to close 'catch' clause")
+                scan += 1
+                catch_body_start, scan = self.scanBlock(scan)
+                catch_clauses.append({'type': excType, 'var': varName, 'start': catch_body_start})
+
+            finally_bounds = None
+            if scan < len(self.lang) and self.lang[scan].get()['type'] == 'FINALLY':
+                scan += 1
+                finally_body_start, scan = self.scanBlock(scan)
+                finally_bounds = finally_body_start
+
+            if not catch_clauses and finally_bounds is None:
+                raise SyntaxError("Expected 'catch' or 'finally' after 'try' block")
+
+            after_construct_pos = scan
+            control_signal = False
+            pending_exception = None
+            try:
+                self.tokPosition = try_body_start
+                control_signal = self.executeBlock()
+            except Exception as caughtExc:
+                handled = False
+                for clause in catch_clauses:
+                    if isinstance(caughtExc, clause['type']):
+                        handled = True
+                        self.me.setLocal(clause['var'], String, String(str(caughtExc)))
+                        self.tokPosition = clause['start']
+                        control_signal = self.executeBlock()
+                        del self.me.locals[clause['var']]
+                        break
+                if not handled:
+                    pending_exception = caughtExc
+
+            if finally_bounds is not None:
+                self.tokPosition = finally_bounds
+                finally_signal = self.executeBlock()
+                if finally_signal:
+                    control_signal = finally_signal
+                    pending_exception = None
+
+            self.tokPosition = after_construct_pos
+
+            if pending_exception is not None:
+                raise pending_exception
+            if control_signal == 'break':
+                return 'break'
+            elif control_signal == 'continue':
+                return 'continue'
+            elif control_signal is True:
+                return True
+            return False
         elif tok_type == 'FOR':
             # for (<type?> <id> = <val>; <id_reference_condition>; <stmt?>)
             # for (<type?> <id> : <collectionID>)
@@ -2428,12 +2694,19 @@ class Method:
                 raise RuntimeError(f"'{tok_type}' outside of loop")
             
             return tok_type.lower()  # 'break' or 'continue'
-        if tok_type == 'NATIVE_PRINT_STMT':
-            value = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(2), ')'))
-            print(value.get())
-        if tok_type == 'NATIVE_PRINT_STMT_nline':
-            value = Expression.evaluate(self.me, self.me.getArgs(), self.read(self.peek(2), ')'))
-            print(value.get(),end="")
+        elif tok_type == 'NATIVE_PRINT_STMT' or tok_type == 'NATIVE_PRINT_STMT_nline':
+            # Get everything between parentheses, respecting nesting
+            if self.peek().get()['type'] == 'LPAREN':
+                expr_tokens = self.readUntilMatching(self.peek(), '(', ')')
+                # The tokens include the outer parentheses, so we need to strip them
+                inner_tokens = expr_tokens[1:-1]  # Remove '(' and ')'
+                value = Expression.evaluate(self.me, self.me.getArgs(), inner_tokens)
+                endChar = '\n' if tok_type == 'NATIVE_PRINT_STMT' else ''
+                print(value.get(), end=endChar)
+                self.tokPosition += len(expr_tokens) + 1  # Skip the expression + the ')' we already consumed
+                # Skip semicolon if present
+                if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                    self.tokPosition += 1
             
         self.tokPosition += 1
         return False
@@ -2613,7 +2886,7 @@ class Execution:
             elif tok_type in ACCESS_MODIFIERS: # Applies context: 'method_def', 'field_def'
                 self.mode.extend(['method_def', 'field_def'])
             elif tok_type in RETURN_TYPES and 'field_def' in self.mode: # FIELD
-                # Find the actual modifier by looking backward
+                # Look backwards
                 modifier = 'default'
                 i = self.tokPosition - 1
                 while i >= 0:
@@ -2631,12 +2904,12 @@ class Execution:
                         t_type = Bool
                     else:
                         t_type = parseTokenAsType(tok_type, isUnsigned=self.states['UNSIGNED'])
-                    self.handleFieldDefinition(t_type, modifier)  # Pass modifier
+                    self.handleFieldDefinition(t_type, modifier)
                 elif self.next(by=2) == ';':
                     self.mode = []
-                    self.handleNullFieldDefinition(parseTokenAsType(tok_type, isUnsigned=self.states['UNSIGNED']), modifier)  # Pass modifier
+                    self.handleNullFieldDefinition(parseTokenAsType(tok_type, isUnsigned=self.states['UNSIGNED']), modifier)
             elif tok_type == 'IDENTIFIER' and 'field_def' in self.mode:
-                # Check if this is a field definition: ClassName fieldName = ...; or ClassName fieldName;
+                #ClassName fieldName = ...; or ClassName fieldName;
                 if self.tokPosition >= 1:
                     prev_token = self.lang[self.tokPosition - 1]
                     if prev_token.get()['type'] == 'IDENTIFIER' and prev_token.get()['val'] in memory:
@@ -2710,16 +2983,14 @@ class Execution:
                 if 'method_def' in self.mode:
                     # <modifier>, <static?>, <unsigned?>, <return_type>, <method_name> ( <...>
                     #       5         4          3             2              1        ^ WE ARE HERE  
-                    self.mode = ['is_active_method_def', 'arg_def'] # Must specify "is_active_method_def" because it is method definition, not method call
-                    # Will use "is_active_method_call" for method calls
-                    args = argsList(self.handleArgumentDefinition(token)) # This reads the argument definition
+                    self.mode = ['is_active_method_def', 'arg_def']
+                    args = argsList(self.handleArgumentDefinition(token))
                     checkedExecs = self.handleThrowStmt(token, len(list(args.keys())))
-                    del self.info['thisMethodArgs'] # Clear the argument definition memory
+                    del self.info['thisMethodArgs']
                     parseby = 1 if self.states['STATIC'] else 0
                     parseby += 1 if self.states['UNSIGNED'] else 0
                     methodReturnType = parseTokenAsType(self.before(by=2), True, self.states['UNSIGNED'])
                     if methodReturnType is ClassType:
-                        # Must specify exact class if the method is to return one.
                         self.handleMethodDefinition(self.before(), self.before(by=3+parseby), ClassType(self.before(by=2)), self.states['STATIC'], args, checkedExecs)
                     else:
                         self.handleMethodDefinition(self.before(), self.before(by=3+parseby), methodReturnType, self.states['STATIC'], args, checkedExecs)
@@ -2740,7 +3011,7 @@ class Execution:
     def handleFieldDefinition(self, type: object, modifier: str):
         valueTokens = self.read(self.peek(3), ';')
         parsedValue = FieldAssignment.evaluate(valueTokens)
-        # Convert to the expected type
+        # Convert
         converted = convertValue(parsedValue, type)
         setField(ClassReference(self.currentClass), self.next(), modifier, type, converted, isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
         self.clear(noClearMode=True, noClearInfo=True)
@@ -2750,10 +3021,10 @@ class Execution:
         argReader = self.langParse.getSource()[startArgRead:endArgRead]
         self.info['thisMethodArgs'] = {}
         for arg in argReader.split(','):
-            arg = arg.strip() # Removes any whitespace around the argument definition
+            arg = arg.strip() # strip
             if not arg:
                 continue
-            parts = arg.split() # <type> | <name> Split by: space
+            parts = arg.split() # <type> | <name> Split by space
             if len(parts) != 2:  # Expects two entries, type and name
                 raise SyntaxError(f"Invalid argument definition: '{arg}'")
             arg_type_token, arg_name = parts
@@ -2827,6 +3098,7 @@ class Execution:
         endArgRead = self.lang[closeIndex].getPos()['pos']
         methodBody = self.langParse.getSource()[startArgRead:endArgRead]
         memory[self.currentClass]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
+        hasCheckdAllExeceptions(self.currentClass, self.info['thisMethodName'])
         self.tokPosition = closeIndex - 1
 def invokeMethod(className: str, methodName: str, args: list, caller: str, thisRef: 'ObjectReference | None' = None, startClass: str | None = None) -> Returnable:
     if startClass is not None:
@@ -2870,10 +3142,13 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
     mModifier = mInfo['modifier']
     thisScope = perspectiveOfClass(caller, className)
     isAllowedAtThisScope(mModifier, thisScope)
-    m = Method()
-    m.parse()
-    m.execute()
-    return popFrame().returnValue
+    try:
+        m = Method()
+        m.parse()
+        m.execute()
+        return currentFrame().returnValue
+    finally:
+        popFrame()
 
 choice = 'Retry'
 fileName = (input('Enter file name: ') + '.txt')
