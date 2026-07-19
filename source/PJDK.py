@@ -214,8 +214,17 @@ def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterfac
         source = memory
     else:
         source = interfaces
-    ownerThrows = source[ownerName]['methods'][thisMethodName].get('throws', [])
-    methodInfo = source[ownerName]['methods'][thisMethodName]
+    ownerEntry = source[ownerName]['methods'][thisMethodName]
+    if isinstance(ownerEntry, list):
+        methodInfo = None
+        for m in ownerEntry:
+            if m.get('body') is not None:
+                methodInfo = m
+        if methodInfo is None:
+            methodInfo = ownerEntry[0]
+    else:
+        methodInfo = ownerEntry
+    ownerThrows = methodInfo.get('throws', [])
     body = methodInfo.get('body')
     if not body:
         return
@@ -309,15 +318,17 @@ def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterfac
         calleeInfo = memory[className]['methods'].get(methodName)
         if not calleeInfo:
             continue
-        for excType in calleeInfo.get('throws', []):
-            if isProtectedAt(idx, excType):
-                continue
-            if any(issubclass(excType, declared) for declared in ownerThrows):
-                continue
-            raise SyntaxError(
-                f"Unreported exception {excType.__name__}; must be caught or declared to be thrown "
-                f"in method '{thisMethodName}' of class '{ownerName}' (thrown by '{className}.{methodName}')"
-            )
+        calleeOverloads = calleeInfo if isinstance(calleeInfo, list) else [calleeInfo]
+        for overload in calleeOverloads:
+            for excType in overload.get('throws', []):
+                if isProtectedAt(idx, excType):
+                    continue
+                if any(issubclass(excType, declared) for declared in ownerThrows):
+                    continue
+                raise SyntaxError(
+                    f"Unreported exception {excType.__name__}; must be caught or declared to be thrown "
+                    f"in method '{thisMethodName}' of class '{ownerName}' (thrown by '{className}.{methodName}')"
+                )
 def isValidModifier(modifier: str):
     if not (modifier == 'private' or modifier == 'public' or modifier == 'protected' or modifier == 'default'):
         raise TypeError(f'The modifier provided was not either "private" or "public", was "{modifier}"')
@@ -382,18 +393,50 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
         'methods': inherited,
         'fields': inherited_fields
     }
-def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool = False, methodArgs: dict = {}, throws: list = []): # methodReturnType = Void, Byte, Short, Int, Long, String, ClassReference
+def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool = False, methodArgs: dict = {}, throws: list = []):
     isValidReturnType(methodReturnType)
     isValidModifier(methodModifier)
     classInfo = memory[thisClass.getClass()]
-    classInfo['methods'][methodName] = {
-        'name': methodName,
-        'modifier': methodModifier,
-        'returns': methodReturnType,
-        'static': isStatic,
-        'args': methodArgs,
-        'throws': throws
-    }
+    methodInfo = classInfo['methods']
+    if methodName in methodInfo:
+        existing = methodInfo[methodName]
+        if not isinstance(existing, list):
+            existing = [existing]
+        
+        # Check if this signature already exists
+        for m in existing:
+            if len(m['args']) == len(methodArgs):
+                existing_keys = list(m['args'].keys())
+                new_keys = list(methodArgs.keys())
+                if existing_keys == new_keys:
+                    match = True
+                    for key in existing_keys:
+                        if m['args'][key] != methodArgs[key]:
+                            match = False
+                            break
+                    if match:
+                        raise LookupError(f'Method {methodName} with this signature already exists')
+        
+        new_method = {
+            'name': methodName,
+            'modifier': methodModifier,
+            'returns': methodReturnType,
+            'static': isStatic,
+            'args': methodArgs,
+            'throws': throws
+        }
+        existing.append(new_method)
+        methodInfo[methodName] = existing
+    else:
+        methodInfo[methodName] = {
+            'name': methodName,
+            'modifier': methodModifier,
+            'returns': methodReturnType,
+            'static': isStatic,
+            'args': methodArgs,
+            'throws': throws
+        }
+    
     if isStatic:
         staticMethods[methodName] = {
             'class': thisClass.getClass(),
@@ -1202,16 +1245,95 @@ def parseTokenAsType(token: str, acceptVoid: bool = False) -> object:
 def prettyPrint(this: dict):
     import json
     print(json.dumps(this, indent=4,default=str))
+def anyOverload(method_entry: object):
+    """Return a representative method dict for a (possibly overloaded) 'methods' entry.
+    Use this ONLY in contexts that need entry-level metadata that's effectively shared
+    across overloads (e.g. checking whether a method name is static, for permission
+    pre-checks before the specific overload is resolved). Do NOT use this to get a
+    signature's 'args' or 'returns' for an actual call -- use resolveOverload (matching
+    runtime argument values) or findOverloadByDeclaredTypes (matching declared types)
+    instead, since different overloads can have different args/returns."""
+    return method_entry[0] if isinstance(method_entry, list) else method_entry
+
+def argMatchesExpectedType(arg: object, expected_type: object) -> bool:
+    if isinstance(expected_type, ClassType):
+        if not isinstance(arg, ObjectReference):
+            return False
+        arg_class = arg.getClass()
+        return arg_class == expected_type.className or arg_class in getHierarchyOfClass(expected_type.className)
+    if isinstance(expected_type, PrimitiveArrayWrapper):
+        if not isinstance(arg, PrimitiveArray):
+            return False
+        return arg.listType == expected_type.getArrayType()
+    return isinstance(arg, expected_type)
+def resolveOverload(method_entry: object, args: list):
+    """Given a method_entry from a 'methods' dict (either a single method dict, or a list of
+    overload dicts sharing the same name) and a list of RUNTIME argument values, find the
+    overload whose declared parameter types match those values.
+
+    Returns the matching method dict, or None if method_entry is a list and no overload matches.
+    If method_entry is not a list (i.e. the method isn't overloaded), it is returned unchanged."""
+    if not isinstance(method_entry, list):
+        return method_entry
+    for m in method_entry:
+        expected_types = list(m['args'].values())
+        if len(expected_types) != len(args):
+            continue
+        if all(argMatchesExpectedType(args[i], expected_types[i]) for i in range(len(args))):
+            return m
+    return None
+def findOverloadByDeclaredTypes(method_entry: object, declared_arg_types: list):
+    """Given a method_entry (single dict or list of overload dicts) and a list of DECLARED
+    parameter types (i.e. types parsed from a signature, not runtime values), find the overload
+    whose parameter types are equal to declared_arg_types. Used when the only thing available
+    is another declared signature (e.g. while parsing a method body, before any call happens).
+
+    Returns the matching method dict, or None if method_entry is a list and no overload matches.
+    If method_entry is not a list, it is returned unchanged."""
+    if not isinstance(method_entry, list):
+        return method_entry
+    for m in method_entry:
+        m_arg_types = list(m['args'].values())
+        if len(m_arg_types) != len(declared_arg_types):
+            continue
+        if all(expected == actual for expected, actual in zip(m_arg_types, declared_arg_types)):
+            return m
+    return None
+
+def findMethodInClassHierarchy(startClass: str, methodName: str, args: list, source: dict = None):
+    if source is None:
+        source = memory
+    current = startClass
+    while current is not None:
+        classInfo = source.get(current)
+        if classInfo is not None and methodName in classInfo.get('methods', {}):
+            found_method = resolveOverload(classInfo['methods'][methodName], args)
+            if found_method is not None:
+                return found_method, current
+        if classInfo is not None and 'super' in classInfo:
+            current = classInfo['super'].getClass()
+        else:
+            current = None
+    return None, None
 def getArgValById(args: list, nameOfArg: str, methodName: str, className: str):
-    # Returns argument val based on the argument id (the name of the argument)
     methodArgs: dict = {}
     if className in memory:
         search = memory
     elif className in interfaces:
         search = interfaces
-    for _, method in list(search[className]['methods'].items()):
-        if method['name'] == methodName:
-            methodArgs = method['args']
+    
+    method_entry = search[className]['methods'].get(methodName)
+    if method_entry is None:
+        raise RuntimeError(f"Method '{methodName}' not found in '{className}'")
+    
+    found_method = resolveOverload(method_entry, args)
+    if found_method is not None:
+        methodArgs = found_method['args']
+    elif isinstance(method_entry, list):
+        methodArgs = method_entry[0]['args']
+    else:
+        methodArgs = method_entry['args']
+    
     argPos = list(methodArgs.keys())
     if len(argPos) < len(args):
         raise RuntimeError(f'Method {methodName} of class {className} got too many arguments')
@@ -1363,7 +1485,7 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
         memberName = tokens[j + 1].get()['val']
         isCall = j + 2 < len(tokens) and tokens[j + 2].get()['type'] == 'LPAREN'
         if className in memory and memberName in memory[className]['methods']:
-            method_info = memory[className]['methods'][memberName]
+            method_info = anyOverload(memory[className]['methods'][memberName])
             if not method_info.get('static', False) and not className:
                 raise RuntimeError(f"Method '{memberName}' in class '{className}' is not static")
         callerClass = me.class_name if me is not None else (className if className else '')
@@ -1429,7 +1551,7 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
             evaledArgs = [Expression.evaluate(me, methodArgs, g) for g in argGroups]
             
             if className in memory and memberName in memory[className]['methods']:
-                method_info = memory[className]['methods'][memberName]
+                method_info = anyOverload(memory[className]['methods'][memberName])
                 if not method_info.get('static', False):
                     raise RuntimeError(f"Method '{memberName}' in class '{className}' is not static")
                 
@@ -1560,6 +1682,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
             method_handled = False
             if me is not None:
                 method_info = memory.get(me.class_name, {}).get('methods', {}).get(methodName)
+                method_info = anyOverload(method_info)
                 if method_info and method_info.get('static', False):
                     open_paren = i + 1
                     close_paren = matchingParen(tokens, open_paren)
@@ -1817,11 +1940,24 @@ def validateInterfaceImplementation(className: str, interfaceName: str):
                 raise NotImplementedError(f"Class '{className}' does not implement abstract method '{method_name}' from interface '{thisIface}'")
 
             try:
-                class_method = class_info['methods'][method_name]
-                if class_method.get('abstract', True) or not class_method.get('body'):
-                    raise TypeError(f"Method '{method_name}' in class '{className}' cannot be abstract")
+                classEntry = class_info['methods'][method_name]
+                classOverloads = classEntry if isinstance(classEntry, list) else [classEntry]
                 
-                if class_method['returns'] != method_def['returns']:
+                matching = None
+                for class_method in classOverloads:
+                    if class_method.get('abstract', True) or not class_method.get('body'):
+                        continue
+                    if class_method['returns'] != method_def['returns']:
+                        continue
+                    matching = class_method
+                    break
+                
+                if matching is None:
+                    # No overload satisfies this abstract method; surface a meaningful error
+                    # using the first overload for context, matching prior single-method behavior.
+                    class_method = classOverloads[0]
+                    if class_method.get('abstract', True) or not class_method.get('body'):
+                        raise TypeError(f"Method '{method_name}' in class '{className}' cannot be abstract")
                     raise TypeError(
                         f"Return type mismatch for '{method_name}': "
                         f"interface expects {method_def['returns'].__name__}, "
@@ -1963,7 +2099,6 @@ def getSuperOfInterface(interfaceName: str) -> list[str]:
         raise NameError(f'Interface {interfaceName} does not exist')
     return interfaces[interfaceName]['super']
 def getHierarchyOfInterface(interfaceName: str) -> list[str]:
-    """Returns every interface transitively extended by interfaceName (not including itself)."""
     hierarchy: list[str] = []
     def visit(name: str):
         for superName in getSuperOfInterface(name):
@@ -1994,7 +2129,8 @@ def classOrInterfaceInfo(name: str) -> dict:
 class Return:
     @staticmethod
     def ret(me: StackFrame, methodArgs: list, valueByToken: TokenSlice):
-        thisMethodInfo = classOrInterfaceInfo(me.class_name)['methods'][me.method_name]
+        methodEntry = classOrInterfaceInfo(me.class_name)['methods'][me.method_name]
+        thisMethodInfo = resolveOverload(methodEntry, me.getArgs()) or anyOverload(methodEntry)
         if thisMethodInfo['returns'] is Void:
             raise RuntimeError(f'Method "{me.method_name}" of class "{me.class_name}" has return statement, when return type is Void')
         retValue = Expression.evaluate(me, methodArgs, valueByToken)
@@ -2032,8 +2168,21 @@ class Method:
         self.className = currentFrame().class_name
         self.methodName = currentFrame().method_name
         self.args = currentFrame().getArgs()
+        
         if self.className in memory:
-            self.methodInfo = memory[self.className]['methods'][self.methodName]
+            # Handle overloaded methods
+            method_entry = memory[self.className]['methods'].get(self.methodName)
+            if method_entry is None:
+                raise NameError(f"Method '{self.methodName}' not found in class '{self.className}'")
+            
+            if isinstance(method_entry, list):
+                found_method = resolveOverload(method_entry, self.args)
+                if found_method is None:
+                    raise NameError(f"No matching overload for method '{self.methodName}' in class '{self.className}'")
+                self.methodInfo = found_method
+            else:
+                self.methodInfo = method_entry
+            
             self.isInterfaceMethod = False
         elif self.className in interfaces:
             self.methodInfo = interfaces[self.className]['methods'][self.methodName]
@@ -2466,7 +2615,8 @@ class Method:
             
             if self.me.class_name in memory:
                 if methodName in memory[self.me.class_name]['methods']:
-                    method_info = memory[self.me.class_name]['methods'][methodName]
+                    methodEntry = memory[self.me.class_name]['methods'][methodName]
+                    method_info = resolveOverload(methodEntry, evaledArgs) or anyOverload(methodEntry)
                     if method_info.get('static', False):
                         invokeMethod(
                             self.me.class_name,
@@ -3023,8 +3173,7 @@ class Method:
             if a:
                 hasReturned = True
                 break
-        search = memory if not self.isInterfaceMethod else interfaces
-        if not hasReturned and search[self.className]['methods'][self.methodName]['returns'] is not Void:
+        if not hasReturned and self.methodInfo['returns'] is not Void:
             raise RuntimeError(f'No return statement in method "{self.methodName}"')
 class Execution:
     def __init__(self, langParse: Intepreter):
@@ -3117,6 +3266,8 @@ class Execution:
                 if 'is_active_method_def' in self.mode:
                     self.mode = ['is_active_method_def', 'method_body']
                     self.handleMethodBodyContent(token)
+                    if 'thisMethodArgs' in self.info:
+                        del self.info['thisMethodArgs']
                 elif 'is_active_if_def' in self.mode:
                     self.mode = ['is_active_if_def', 'if_body']
                     #self.handleIfCall()
@@ -3339,7 +3490,6 @@ class Execution:
                     self.mode = ['is_active_method_def', 'arg_def']
                     args = argsList(self.handleArgumentDefinition())
                     checkedExecs = self.handleThrowStmt(token, len(list(args.keys())))
-                    del self.info['thisMethodArgs']
                     parseby = 1 if self.states['STATIC'] else 0
                     methodReturnType = parseTokenAsType(self.before(by=2), True)
                     search_pos = self.tokPosition - 3
@@ -3545,7 +3695,6 @@ class Execution:
             'STATIC': False,
         }
     def handleMethodBodyContent(self, currentToken: Token):
-        # Code is not evaluated until an actual method call is made, so no need to parse or evaluate code for now.
         startArgRead = currentToken.getPos()['pos'] + 1
         openIndex = self.tokPosition
         depth = 1
@@ -3563,13 +3712,29 @@ class Execution:
             raise SyntaxError(f"Unterminated method body starting at {currentToken.getPos()}")
         endArgRead = self.lang[closeIndex].getPos()['pos']
         methodBody = self.langParse.getSource()[startArgRead:endArgRead]
+        
         if not self.currentInterface:
-            if self.info['thisMethodName'] in memory[self.currentClass]['methods']:
-                memory[self.currentClass]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
-                memory[self.currentClass]['methods'][self.info['thisMethodName']]['abstract'] = False
+            method_entry = memory[self.currentClass]['methods'].get(self.info['thisMethodName'])
+            if method_entry is not None:
+                if isinstance(method_entry, list):
+                    args = self.info.get('thisMethodArgs', {})
+                    arg_types = list(args.values())
+                    
+                    found_method = findOverloadByDeclaredTypes(method_entry, arg_types)
+                    
+                    if found_method is not None:
+                        found_method['body'] = methodBody.strip()
+                        found_method['abstract'] = False
+                    else:
+                        method_entry[0]['body'] = methodBody.strip()
+                        method_entry[0]['abstract'] = False
+                else:
+                    method_entry['body'] = methodBody.strip()
+                    method_entry['abstract'] = False
         else:
             interfaces[self.currentInterface]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
             interfaces[self.currentInterface]['methods'][self.info['thisMethodName']]['abstract'] = False
+        
         holder = self.currentClass if not self.currentInterface else self.currentInterface
         hasCheckdAllExeceptions(holder, self.info['thisMethodName'], not not self.currentInterface)
         self.tokPosition = closeIndex - 1
@@ -3579,20 +3744,11 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
             lookup_class = startClass
         else:
             lookup_class = className
-        found_method = None
         
-        current = lookup_class
-        while current is not None:
-            if current in memory and methodName in memory[current].get('methods', {}):
-                found_method = memory[current]['methods'][methodName]
-                break
-            if current in memory and 'super' in memory[current]:
-                current = memory[current]['super'].getClass()
-            else:
-                current = None
+        found_method, found_class = findMethodInClassHierarchy(lookup_class, methodName, args)
         
         if found_method is None:
-            raise NameError(f"Method '{methodName}' not found in class hierarchy starting from '{lookup_class}'")
+            raise NameError(f"Method '{methodName}' with matching arguments not found in class hierarchy starting from '{lookup_class}'")
         
         if found_method.get('static', False):
             if thisRef is not None:
@@ -3604,15 +3760,16 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
                     thisRef = callStack[-1].this
                 else:
                     raise RuntimeError(f"Cannot call instance method '{methodName}' without 'this' reference")
-        mInfo = memory[className]['methods'][methodName]
+        
+        mInfo = found_method
         mArgTypes = list(mInfo['args'].values())
         for mArgId in range(len(mArgTypes)):
             isConsistentTypes(args[mArgId], mArgTypes[mArgId])
             args[mArgId] = coerceValue(args[mArgId], mArgTypes[mArgId])
-        pushFrame(methodName, className, thisRef or newObject(className), args)
+        pushFrame(methodName, found_class, thisRef or newObject(found_class), args)
 
         mModifier = mInfo['modifier']
-        thisScope = perspectiveOfClass(caller, className)
+        thisScope = perspectiveOfClass(caller, found_class)
         isAllowedAtThisScope(mModifier, thisScope)
     else:
         if not isInterface(className):
@@ -3662,7 +3819,8 @@ while choice == 'Retry':
         try:
             if ENTRY['entryClass'] not in memory or ENTRY_METHOD_NAME not in memory[ENTRY['entryClass']]['methods']:
                 raise NameError(f'An unexpected error occured while resolving "{ENTRY_METHOD_NAME}"')
-            entryArgTypes = list(memory[ENTRY['entryClass']]['methods'][ENTRY_METHOD_NAME]['args'].values())
+            entryMethodEntry = memory[ENTRY['entryClass']]['methods'][ENTRY_METHOD_NAME]
+            entryArgTypes = list(anyOverload(entryMethodEntry)['args'].values())
             callArgs = []
             if entryArgTypes:
                 rawArgs = userArgs.split()
