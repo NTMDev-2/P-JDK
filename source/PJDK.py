@@ -164,9 +164,9 @@ def isAllowedAtThisScope(modifier: str, thisScope: str, isInterface: bool = Fals
         return True
     if modifier == "default": # This will have "isSamePackage" check later
         return True
-    if modifier == "protected" and thisScope == "subclass":
+    if modifier == "protected" and thisScope in ('other', "subclass"):
         return True
-    raise PermissionError('Attempted to access a field or method without sufficient permission')
+    raise PermissionError('Attempted to access a field, method, or constructor without sufficient permission')
 def isConsistentTypes(thisType: object, otherType: object) -> bool:
     if isinstance(otherType, Null) or otherType is Null and issubclass(thisType, Nullable):
         return True
@@ -454,6 +454,21 @@ def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str
             'returns': methodReturnType,
             'args': methodArgs
         }
+def createConstructor(className: str, modifier: str, body: str, args: dict = {}):
+    isValidModifier(modifier)
+    if 'constructor' not in memory[className]:
+        memory[className]['constructor'] = []
+    if findOverloadByDeclaredTypes(memory[className]['constructor'], list(args.keys())):
+        raise LookupError(f'Constructor of {className} with this signature already exists')
+    memory[className]['constructor'].append(
+    {
+        'modifier': modifier,
+        'args': args, 
+        'body': body,
+        'constructor': True
+    }
+    )
+
 def argsList(args: dict[str, object]) -> dict: # This sets and compiles an argument list for a method
     """{'name': <returnType>}"""
     for _, expectedType in list(args.items()):
@@ -624,7 +639,7 @@ def currentFrame() -> StackFrame:
         raise RuntimeError("No active stack frame")
     return callStack[-1]
 
-def newObject(class_name: str) -> ObjectReference:
+def newObject(class_name: str, constructorArgs: list = [], callerClass: str = '') -> ObjectReference:
     global nextHeapId
     
     if class_name not in memory:
@@ -637,7 +652,39 @@ def newObject(class_name: str) -> ObjectReference:
         field_name = field_def['name']
         default_value = field_def['value']
         obj.fields[field_name] = default_value
+    if 'constructor' in memory[class_name]:
+        constructor_entry = memory[class_name]['constructor']
+        matched_constructor = resolveOverload(constructor_entry, constructorArgs)
+        if matched_constructor is None:
+            if len(constructorArgs) == 0:
+                for cons in constructor_entry:
+                    if len(cons['args']) == 0:
+                        matched_constructor = cons
+                        break
+            if matched_constructor is None:
+                raise RuntimeError(f"No matching constructor found for class '{class_name}' with {len(constructorArgs)} arguments")
+        
+        obj_id = nextHeapId
+        nextHeapId += 1
+        heap[obj_id] = obj
+        isAllowedAtThisScope(matched_constructor['modifier'], perspectiveOfClass(class_name, callerClass))
+        pushFrame('<init>', class_name, ObjectReference(obj_id), constructorArgs)
+        
+        cons_method = Method()
+        cons_method.methodName = '<init>'
+        cons_method.className = class_name
+        cons_method.args = constructorArgs
+        cons_method.methodInfo = matched_constructor
+        cons_method.methodBody = matched_constructor.get('body', '')
+        cons_method.isInterfaceMethod = False
+        cons_method.tokPosition = 0
+        cons_method.isInLoop = False
+        cons_method.parse()
+        cons_method.execute()
+        # Pop the constructor frame
+        popFrame()
     
+
     obj_id = nextHeapId
     nextHeapId += 1
     heap[obj_id] = obj
@@ -1367,8 +1414,10 @@ def getArgValById(args: list, nameOfArg: str, methodName: str, className: str):
         search = memory
     elif className in interfaces:
         search = interfaces
-    
-    method_entry = search[className]['methods'].get(methodName)
+    if methodName == '<init>':
+        method_entry = search[className]['constructor']
+    else:
+        method_entry = search[className]['methods'].get(methodName)
     if method_entry is None:
         raise RuntimeError(f"Method '{methodName}' not found in '{className}'")
     
@@ -1491,14 +1540,15 @@ def matchingBrace(tokens: TokenSlice, openIdx: int) -> int:
     j = openIdx + 1
     while j < len(tokens):
         tt = tokens[j].get()['type']
-        if tt == 'LBRACE':
+        if tt == 'START_DECLARATION':
             depth += 1
-        elif tt == 'RBRACE':
+        elif tt == 'END_DECLARATION':
             depth -= 1
             if depth == 0:
                 return j
+        print(tt, depth)
         j += 1
-    raise SyntaxError("Unmatched '{' in array initializer")
+    raise SyntaxError("Unmatched brace")
 
 def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: TokenSlice, startIdx: int):
     leftToken = tokens[startIdx]
@@ -1679,9 +1729,20 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                 continue
             else:
                 className = tokens[i+1].get()['val']
-                closeIdx = matchingParen(tokens, i + 2)
-                out.append(Token.wrap(newObject(className)))
-                i = closeIdx + 1
+                openParen = i + 2
+                closeParen = matchingParen(tokens, openParen)
+                
+                arg_tokens = tokens[openParen + 1 : closeParen]
+                if arg_tokens:
+                    arg_groups = Token.splitArgs(arg_tokens)
+                    evaled_args = [Expression.evaluate(me, methodArgs, group) for group in arg_groups]
+                    
+                    obj = newObject(className, evaled_args, me.class_name)
+                else:
+                    obj = newObject(className)
+                
+                out.append(Token.wrap(obj))
+                i = closeParen + 1
                 continue
         elif t in ('IDENTIFIER', 'THIS', 'SUPER') and i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'DOT': # Complex call
             resolved, nextIdx = resolveDotChain(me, methodArgs, tokens, i)
@@ -2029,7 +2090,7 @@ class Expression:
             if t is None:
                 t = None
             else:
-                t = t['val']
+                t = t['type']
             if t == 'LONG_LITERAL':
                 assumeType = 'long'
             elif t == 'BYTE_LITERAL':
@@ -2224,11 +2285,12 @@ class Method:
         self.args = currentFrame().getArgs()
         
         if self.className in memory:
-            # Handle overloaded methods
-            method_entry = memory[self.className]['methods'].get(self.methodName)
+            if self.methodName == '<init>':
+                method_entry = memory[self.className]['constructor']
+            else:
+                method_entry = memory[self.className]['methods'].get(self.methodName)
             if method_entry is None:
                 raise NameError(f"Method '{self.methodName}' not found in class '{self.className}'")
-            
             if isinstance(method_entry, list):
                 found_method = resolveOverload(method_entry, self.args)
                 if found_method is None:
@@ -2355,18 +2417,33 @@ class Method:
 
         isClassAssign = isClass(tok_val)
 
-        if (tok_type in RETURN_TYPES or isClassAssign) and (self.next(by=2) == '=' or self.next(by=2) == ';'): # Local definition
-            # <type> <name> = <value>;
-            # <type> <name>;
+        if (tok_type in RETURN_TYPES or isClassAssign) and (self.next(by=2) == '=' or self.next(by=2) == ';'): # Local assignment
             var_name = self.next()
-            self.tokPosition += 1
-            if var_name in self.me.locals:
-                raise NameError(f'The variable \'{var_name}\' was already declared in this context')
-            if self.next(1) == '=':
-                assignToClass = ClassReference(tok_val) if isClassAssign else None
-                LocalAssignment.assign(self.me, self.args, [tok_val, var_name], self.read(self.peek(2), ';'), assignToClass)
+            self.tokPosition += 2  
+            if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'ASSIGN':
+                self.tokPosition += 1  # Skip '='
+                
+                rhs_tokens = []
+                while self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
+                    rhs_tokens.append(self.lang[self.tokPosition])
+                    self.tokPosition += 1
+                
+                if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                    self.tokPosition += 1
+                else:
+                    raise SyntaxError("Expected ';' after variable declaration")
+                if isClassAssign:
+                    assignToClass = ClassReference(tok_val)
+                    LocalAssignment.assign(self.me, self.args, [tok_val, var_name], rhs_tokens, assignToClass)
+                else:
+                    LocalAssignment.assign(self.me, self.args, [tok_val, var_name], rhs_tokens)
+            
             elif self.next(1) == ';':
-                self.me.setLocal(var_name, parseTokenAsType(tok_val), Null())
+                self.tokPosition += 1  # Skip ';'
+                if isClassAssign:
+                    self.me.setLocal(var_name, ClassType(tok_val), Null())
+                else:
+                    self.me.setLocal(var_name, parseTokenAsType(tok_val), Null())
             return False
         elif (tok_type in RETURN_TYPES or isClass(tok_val)) and self.peek().get()['type'] == 'LBRACKET':
             result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type, self.me, self.args)
@@ -2609,7 +2686,7 @@ class Method:
                     return False
         elif tok_type == 'IDENTIFIER' and self.next() == '=' and self.before(2, getType='type') not in RETURN_TYPES: # Simple assignment
             var_name = tok_val
-            self.tokPosition += 2 
+            self.tokPosition += 2
 
             if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'NEW':
                 self.tokPosition -= 2 
@@ -2668,7 +2745,6 @@ class Method:
                 self.tokPosition += 1
             else:
                 raise SyntaxError("Expected ';' after assignment")
-            
             new_value = Expression.evaluate(self.me, self.args, rhs_tokens)
             updated = False
             # Local
@@ -2816,7 +2892,6 @@ class Method:
                         return False
                     else:
                         raise RuntimeError(f"Cannot call non-static method \"{methodName}\" in static context")
-            
             raise NameError(f"Method '{methodName}' not found in class '{self.me.class_name}'")
         elif tok_type == EvalTokens.TOKENS['return']:
             Return.ret(self.me, self.args, self.read(self.peek(), ';'))
@@ -3320,7 +3395,9 @@ class Method:
             if a:
                 hasReturned = True
                 break
-        if not hasReturned and self.methodInfo['returns'] is not Void:
+        if self.methodInfo.get('constructor', False):
+            pass
+        elif not hasReturned and self.methodInfo['returns'] is not Void:
             raise RuntimeError(f'No return statement in method "{self.methodName}"')
 class Execution:
     def __init__(self, langParse: Intepreter):
@@ -3380,7 +3457,7 @@ class Execution:
                 prev_token = self.lang[self.tokPosition - 1]
                 if prev_token.get()['type'] == 'NEW':
                     is_constructor_call = True
-                
+            
             if self.currentClass and not self.info.get('isInMethod', False) and 'field_def' not in self.mode: # Applies context based on 'default'
                 if tok_type in RETURN_TYPES or (tok_type == 'IDENTIFIER' and tok_val in memory):
                     next_token = self.peek(1) if self.tokPosition + 1 < len(self.lang) else None
@@ -3391,6 +3468,7 @@ class Execution:
                             self.mode.append('field_def')
             if tok_type == EvalTokens.TOKENS['(']:
                 self.info['parenStack'] = self.info.get('parenStack', 0) + 1
+            
             if tok_type == 'EOF':
                 if self.info.get('braceStack', 0) > 0:
                     raise SyntaxError(f'Reached EOF, but there were still {self.info.get("braceStack")} unclosed braces')
@@ -3534,6 +3612,41 @@ class Execution:
             elif tok_type == EvalTokens.TOKENS['abstract']:
                 self.states['ABSTRACT'] = True
                 self.info['readBy'] = self.info.get('readBy', 1) + 1
+            elif tok_type in ACCESS_MODIFIERS and self.next() == self.currentClass and self.next(2) == '(':
+                modifier = tok_val
+                if tok_val == 'default':
+                    raise NameError('Modifier "default" not allowed in constructor definition')
+                self.tokPosition += 2 
+                openParenIdx = self.tokPosition
+                closeParenIdx = matchingParen(self.lang, openParenIdx)
+                constructorArgs = argsList(self.handleArgumentDefinition())
+                self.tokPosition = closeParenIdx + 1
+                
+                if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'START_DECLARATION':
+                    openBracePos = self.tokPosition
+                    
+                    depth = 1
+                    scan = openBracePos + 1
+                    while scan < len(self.lang):
+                        t = self.lang[scan].get()['type']
+                        if t == 'START_DECLARATION':
+                            depth += 1
+                        elif t == 'END_DECLARATION':
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        scan += 1
+                    
+                    if depth != 0:
+                        raise SyntaxError("Unterminated constructor body")
+                    
+                    source = self.langParse.getSource()
+                    openPos = self.lang[openBracePos].getPos()['pos'] + 1
+                    closePos = self.lang[scan].getPos()['pos']
+                    body = source[openPos:closePos]
+                    
+                    createConstructor(self.currentClass, modifier, body, constructorArgs)
+                    self.tokPosition = scan + 1
             elif tok_type in ACCESS_MODIFIERS: # Applies context: 'method_def', 'field_def'
                 self.mode.extend(['method_def', 'field_def'])
             elif tok_type in RETURN_TYPES and ('field_def' in self.mode or self.next(2) == '='): # FIELD
@@ -3651,7 +3764,6 @@ class Execution:
                         search_pos -= 1
                     
                     isValidModifier(methodModifier)
-
                     if methodReturnType is ClassType:
                         self.handleMethodDefinition(self.before(), methodModifier, ClassType(self.before(by=2)), self.states['STATIC'], args, checkedExecs)
                     else:
