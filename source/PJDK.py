@@ -656,27 +656,30 @@ class PrimitiveArray(Returnable):
         self.size = size
         for i in initialValues:
             try:
+                if type(i) is Null and type(listType) is ClassType: # Skip default
+                    self.values.append(coerceValue(i, listType))
+                    continue
                 isConsistentTypes(i, listType)
             except Exception:
-                raise Exception(f'List value {i} has inconsistent type {type(i).__name__}, when type {listType.__name__} was expected')
+                raise Exception(f'List value {i} has inconsistent type {type(i).__name__}, when type {type(listType).__name__} was expected')
             self.values.append(coerceValue(i, listType))
         self.listType = listType
     def get(self, elementByIndex: int | None = None):
         if elementByIndex is None:
-            return self.returnThis()['value']
+            return self
         if elementByIndex < 0:
             raise Exception('Cannot have negative index')
         if elementByIndex > len(self.values):
             raise Exception('Array index out of bounds, index was too large')
         return self.values[elementByIndex]
-    def append(self, value: object):
-        try:
-            isConsistentTypes(value, self.listType)
-        except Exception:
-            raise Exception(f'Value {value} has inconsistent type {type(value)}, when type {type(self.listType)} was expected')
-        if len(self.values) == self.size:
-            raise Exception(f'List has reached maximum size of {self.size}')
-        self.values.append(coerceValue(value, self.listType))
+    def set(self, index: int, value: object):
+        if index is None:
+            return self.returnThis()['value']
+        if index < 0:
+            raise Exception('Cannot have negative index')
+        if index > len(self.values):
+            raise Exception('Array index out of bounds, index was too large')
+        self.values[index] = coerceValue(value, self.listType)
     def remove(self, elementByIndex: int):
         if elementByIndex < 0:
             raise Exception('Cannot have negative index')
@@ -697,7 +700,7 @@ class PrimitiveArrayWrapper(PrimitiveArray):
 class ArrayAssignment:
     @staticmethod
     def parse(lang: TokenSlice, tokPosition: int, elementTypeTok: str,
-              me: StackFrame | None = None, methodArgs: list | None = None):
+            me: StackFrame | None = None, methodArgs: list | None = None):
         # <type>[<int?>] <name> = new <type_consistent>[<int?>]<{args*}?>;
         arrayType = parseTokenAsType(elementTypeTok)
         pos = tokPosition + 1
@@ -731,46 +734,100 @@ class ArrayAssignment:
         if lang[pos].get()['type'] != 'ASSIGN':
             raise SyntaxError("Expected '=' or ';' after array name")
         pos += 1
-        if lang[pos+1].get()['type'] not in RETURN_TYPES: # Simple assignment?
-            try:
-                ClassReference(lang[pos+1].get()['val'])
-                isConsistentTypes(parseTokenAsType(lang[pos+1].get()['val']), arrayType)
-            except Exception:
-                pass
-        else:
-            isConsistentTypes(parseTokenAsType(lang[pos+1].get()['val']), arrayType)
-        rhs_tokens = []
-        while pos < len(lang) and lang[pos].get()['type'] != 'SEMICOLON':
-            rhs_tokens.append(lang[pos])
+        
+        if pos < len(lang) and lang[pos].get()['type'] == 'NEW':
+            pos += 1  # Skip 'new'
+            if pos >= len(lang):
+                raise SyntaxError("Expected array type after 'new'")
+            
+            element_type_token = lang[pos].get()['type']
+            element_type_name = lang[pos].get()['val']
             pos += 1
-        if pos >= len(lang) or lang[pos].get()['type'] != 'SEMICOLON':
-            raise SyntaxError("Expected ';' after array declaration")
-        pos += 1
-        # rhs: new <type> [] <START_DELC?> ...
-        #                         ^ Check here
-        rhs_As_Str = [t.get()['val'] for t in rhs_tokens]
-        try:
-            startInitIdx = rhs_As_Str.index('{')
-        except ValueError:
-            startInitIdx = -1 # Not?
-        if startInitIdx >= 0: # Initialize?
-            values = []
-            thisElementExpr = []
-            for token in rhs_tokens[startInitIdx+1:]:
-                if token.get()['val'] == ',':
-                    values.append(Expression.evaluate(me, methodArgs, thisElementExpr))
-                    thisElementExpr = []
-                    isConsistentTypes(type(values[-1]), arrayType)
-                    continue
-                elif token.get()['val'] == '}':
-                    if len(thisElementExpr) > 0: 
-                        values.append(Expression.evaluate(me, methodArgs, thisElementExpr)) # Last element
-                    break
-                elif token.get()['type'] == 'EOF':
-                    raise RuntimeError('Reach end of line when more array values were expected')
-                thisElementExpr.append(token)
-            array_value = PrimitiveArray(len(values), values, arrayType)
+            
+            if element_type_token in RETURN_TYPES:
+                element_type = parseTokenAsType(element_type_name)
+            elif isClass(element_type_name):
+                element_type = ClassType(element_type_name)
+            else:
+                raise SyntaxError(f"Unknown array element type: {element_type_name}")
+            
+            if pos >= len(lang) or lang[pos].get()['type'] != 'LBRACKET':
+                raise SyntaxError("Expected '[' after array type")
+            pos += 1
+            
+            size_value = None
+            if lang[pos].get()['type'] != 'RBRACKET':
+                size_tokens = []
+                while pos < len(lang) and lang[pos].get()['type'] != 'RBRACKET':
+                    size_tokens.append(lang[pos])
+                    pos += 1
+                if pos >= len(lang) or lang[pos].get()['type'] != 'RBRACKET':
+                    raise SyntaxError("Expected ']' after array size")
+                size_value = Expression.evaluate(me, methodArgs, size_tokens)
+                if not isinstance(size_value, Int):
+                    raise RuntimeError("Array size must be an integer")
+            pos += 1  # Skip ']'
+            
+            actual_size = size_value.get() if size_value is not None else 0
+            
+            # Check for array initializer
+            if pos < len(lang) and lang[pos].get()['type'] == 'START_DECLARATION':
+                # { values }
+                pos += 1  # Skip '{'
+                values = []
+                while pos < len(lang) and lang[pos].get()['type'] != 'END_DECLARATION':
+                    if lang[pos].get()['type'] == 'COMMA':
+                        pos += 1
+                        continue
+                    value_tokens = []
+                    paren_depth = 0
+                    while pos < len(lang):
+                        t = lang[pos]
+                        if t.get()['type'] == 'END_DECLARATION' and paren_depth == 0:
+                            break
+                        if t.get()['type'] == 'COMMA' and paren_depth == 0:
+                            break
+                        if t.get()['type'] == 'LPAREN':
+                            paren_depth += 1
+                        elif t.get()['type'] == 'RPAREN':
+                            paren_depth -= 1
+                        value_tokens.append(t)
+                        pos += 1
+                    if value_tokens:
+                        val = Expression.evaluate(me, methodArgs, value_tokens)
+                        # For class types, we need to handle ObjectReferences properly
+                        if isinstance(element_type, ClassType):
+                            if isinstance(val, ObjectReference):
+                                # Check if the object is of the right type
+                                val_class = val.getClass()
+                                if val_class != element_type.className and element_type.className not in getHierarchyOfClass(val_class):
+                                    raise TypeError(f"Cannot assign {val_class} to array of {element_type.className}")
+                            else:
+                                raise TypeError(f"Expected ObjectReference, got {type(val)}")
+                        values.append(coerceValue(val, element_type))
+                pos += 1
+                
+                if size_value is not None and len(values) != actual_size:
+                    raise RuntimeError(f"Array size mismatch: declared {actual_size}, got {len(values)} elements")
+                array_value = newPrimitiveArray(element_type, len(values), values)
+            else:
+                array_value = newPrimitiveArray(element_type, actual_size)
+            
+            while pos < len(lang) and lang[pos].get()['type'] != 'SEMICOLON':
+                pos += 1
+            if pos >= len(lang) or lang[pos].get()['type'] != 'SEMICOLON':
+                raise SyntaxError("Expected ';' after array initialization")
+            pos += 1
+            
+            return var_name, arrayType, array_value, pos
         else:
+            rhs_tokens = []
+            while pos < len(lang) and lang[pos].get()['type'] != 'SEMICOLON':
+                rhs_tokens.append(lang[pos])
+                pos += 1
+            if pos >= len(lang) or lang[pos].get()['type'] != 'SEMICOLON':
+                raise SyntaxError("Expected ';' after array declaration")
+            pos += 1
             array_value = Expression.evaluate(me, methodArgs, rhs_tokens)
             if not isinstance(array_value, PrimitiveArray):
                 raise RuntimeError(f"Cannot assign non-array value to array variable '{var_name}'")
@@ -778,7 +835,7 @@ class ArrayAssignment:
                 raise RuntimeError(
                     f"Array size mismatch for '{var_name}': declared size {declared_size}, got {array_value.size}"
                 )
-        return var_name, arrayType, array_value, pos
+            return var_name, arrayType, array_value, pos
 
 class EvalTokens():
     TOKENS = {
@@ -1246,13 +1303,6 @@ def prettyPrint(this: dict):
     import json
     print(json.dumps(this, indent=4,default=str))
 def anyOverload(method_entry: object):
-    """Return a representative method dict for a (possibly overloaded) 'methods' entry.
-    Use this ONLY in contexts that need entry-level metadata that's effectively shared
-    across overloads (e.g. checking whether a method name is static, for permission
-    pre-checks before the specific overload is resolved). Do NOT use this to get a
-    signature's 'args' or 'returns' for an actual call -- use resolveOverload (matching
-    runtime argument values) or findOverloadByDeclaredTypes (matching declared types)
-    instead, since different overloads can have different args/returns."""
     return method_entry[0] if isinstance(method_entry, list) else method_entry
 
 def argMatchesExpectedType(arg: object, expected_type: object) -> bool:
@@ -1267,12 +1317,6 @@ def argMatchesExpectedType(arg: object, expected_type: object) -> bool:
         return arg.listType == expected_type.getArrayType()
     return isinstance(arg, expected_type)
 def resolveOverload(method_entry: object, args: list):
-    """Given a method_entry from a 'methods' dict (either a single method dict, or a list of
-    overload dicts sharing the same name) and a list of RUNTIME argument values, find the
-    overload whose declared parameter types match those values.
-
-    Returns the matching method dict, or None if method_entry is a list and no overload matches.
-    If method_entry is not a list (i.e. the method isn't overloaded), it is returned unchanged."""
     if not isinstance(method_entry, list):
         return method_entry
     for m in method_entry:
@@ -1283,13 +1327,6 @@ def resolveOverload(method_entry: object, args: list):
             return m
     return None
 def findOverloadByDeclaredTypes(method_entry: object, declared_arg_types: list):
-    """Given a method_entry (single dict or list of overload dicts) and a list of DECLARED
-    parameter types (i.e. types parsed from a signature, not runtime values), find the overload
-    whose parameter types are equal to declared_arg_types. Used when the only thing available
-    is another declared signature (e.g. while parsing a method body, before any call happens).
-
-    Returns the matching method dict, or None if method_entry is a list and no overload matches.
-    If method_entry is not a list, it is returned unchanged."""
     if not isinstance(method_entry, list):
         return method_entry
     for m in method_entry:
@@ -1803,7 +1840,7 @@ def resolveValue(me: StackFrame | None, methodArgs: list | None, tok: Token):
             foundRetValue = name
             
     if foundRetValue is None:
-        raise RuntimeError(f"'{name}' is not a local variable, argument, field, or static member of '{me.class_name}'")
+        raise RuntimeError(f"'{name}' could not be resolved locally, statically or non-statically, in context of Class '{me.class_name}'")
     elif isinstance(foundRetValue, Null):
         raise RuntimeError(f'NullPointerException: {tok}')
     else:
@@ -2314,7 +2351,7 @@ class Method:
             elif self.next(1) == ';':
                 self.me.setLocal(var_name, parseTokenAsType(tok_val), default_value_for_type(parseTokenAsType(tok_val)))
             return False
-        elif (tok_type in RETURN_TYPES) and self.peek().get()['type'] == 'LBRACKET':
+        elif (tok_type in RETURN_TYPES or isClass(tok_val)) and self.peek().get()['type'] == 'LBRACKET':
             result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type, self.me, self.args)
             if result is None:
                 return False
@@ -2553,7 +2590,7 @@ class Method:
                     # ???
                     self.tokPosition += 1
                     return False
-        elif tok_type == 'IDENTIFIER' and self.peek().get()['type'] == 'ASSIGN' and self.before(2, getType='type') not in RETURN_TYPES: # Simple assignment
+        elif tok_type == 'IDENTIFIER' and self.next() == '=' and self.before(2, getType='type') not in RETURN_TYPES: # Simple assignment
             var_name = tok_val
             self.tokPosition += 2 
 
@@ -2605,6 +2642,46 @@ class Method:
             if not updated:
                 raise RuntimeError(f"Cannot find variable '{var_name}' to assign")
             return False
+        elif tok_type == 'IDENTIFIER' and self.next() == '[' and (self.before(getType='type') not in RETURN_TYPES and not isClass(self.before())): # Array assignment
+            array_name = tok_val
+            close_bracket = matchingBracket(self.lang, self.tokPosition + 1)
+            
+            index_tokens = self.lang[self.tokPosition + 2 : close_bracket]
+            index_value = Expression.evaluate(self.me, self.args, index_tokens)
+            
+            if not isinstance(index_value, Int):
+                raise RuntimeError("Array index must be an integer")
+            index = index_value.get()
+            
+            self.tokPosition = close_bracket + 1
+            
+            if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'ASSIGN':
+                self.tokPosition -= 1
+            else:
+                self.tokPosition += 1
+                
+                rhs_tokens = []
+                while self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
+                    rhs_tokens.append(self.lang[self.tokPosition])
+                    self.tokPosition += 1
+                
+                if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
+                    raise SyntaxError("Expected ';' after array assignment")
+                self.tokPosition += 1
+                new_value = Expression.evaluate(self.me, self.args, rhs_tokens)
+                array_obj = resolveValue(self.me, self.args, token)
+                
+                if not isinstance(array_obj, PrimitiveArray):
+                    raise RuntimeError(f"'{array_name}' is not an array")
+                
+                if index < 0 or index >= array_obj.size:
+                    raise RuntimeError(f"Array index {index} out of bounds for array of size {array_obj.size}")
+                
+                coerced_value = coerceValue(new_value, array_obj.listType)
+                isConsistentTypes(coerced_value, array_obj.listType)
+                array_obj.set(index, coerced_value)
+                
+                return False
         elif tok_type == 'IDENTIFIER' and self.peek().get()['type'] == 'LPAREN' and not self.before() == '.': # Simple method call
             methodName = tok_val
             openParenIdx = self.tokPosition + 1
@@ -2968,6 +3045,8 @@ class Method:
             parseIdBy = 0
             if self.next(by=2,getType='type') not in RETURN_TYPES:
                 parseIdBy -= 1
+            if isClass(self.next(by=2)):
+                parseIdBy += 1
             if self.next(by=4+parseIdBy) == '=':
                 forLoopStmt = self.read(self.peek(), ')')
                 idTypeRead = self.peek(by=2+parseIdBy).get()
@@ -2997,8 +3076,6 @@ class Method:
                 self.tokPosition += 1
                 body_start = self.tokPosition 
 
-                # Pre-scan to find the position right after the matching '}' so we can
-                # reliably resume execution there regardless of how the loop terminates.
                 scan = body_start
                 depth = 1
                 closed = False
@@ -3032,7 +3109,6 @@ class Method:
                         self.isInLoop = False
                         return True
                     if varUpdateExpr is not None:
-                        # Increment
                         if len(varUpdateExpr) >= 2:
                             first_tok = varUpdateExpr[0]
                             second_tok = varUpdateExpr[1] if len(varUpdateExpr) > 1 else None
@@ -3073,7 +3149,10 @@ class Method:
                     raise SyntaxError("Malformed loop statement")
                 type_token = left_parts[0].get()['val']
                 var_name = left_parts[1].get()['val']
-                var_type = parseTokenAsType(type_token)
+                if isClass(type_token):
+                    var_type = ClassType(type_token)
+                else:
+                    var_type = parseTokenAsType(type_token)
                 
                 collection_expr = forStmt[colon_idx + 1:]
                 collection = Expression.evaluate(self.me, self.args, collection_expr)
@@ -3108,7 +3187,9 @@ class Method:
                 after_for_pos = scan
 
                 self.isInLoop = True
-                
+                if isinstance(elements, PrimitiveArray):
+                    elements = elements.values
+
                 for element in elements:
                     self.me.setLocal(var_name, var_type, element)
                     self.tokPosition = body_start
