@@ -126,8 +126,6 @@ class Null():
     def get(self):
         return None
 class ExceptionValue(Returnable):
-    """Wraps a caught Python exception so DSL code can call e.getMessage() on it,
-    while still behaving like a String (via get()) for concatenation/printing."""
     def __init__(self, excType: type, message: str):
         self.excType = excType
         self.message = message
@@ -199,26 +197,6 @@ def isConsistentTypes(thisType: object, otherType: object) -> bool:
     
     raise TypeError(f'Type {otherType.__name__} does not support type {thisType.__name__}')
 def hasCheckedAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterface: bool = False):
-    """
-    Static (parse-time) check: for every call inside <thisMethodName>'s body to another
-    method that declares exceptions in its own 'throws' clause, verify that this method
-    either (a) declares that same exception (or a supertype of it) in its own 'throws'
-    clause, or (b) wraps the call in a try/catch that catches that exception (or a
-    supertype). Raises SyntaxError if a thrown exception is neither caught nor declared.
-
-    Note: this DSL has no built-in notion of "unchecked" exceptions (there's no clean
-    equivalent of Java's RuntimeException umbrella over Python's builtin exception
-    classes), so every exception listed in a method's 'throws' clause is treated as
-    checked and must be handled by callers.
-
-    This is a best-effort static check, not a full compiler pass: it can only resolve
-    calls that are statically determinable from the source text -- unqualified calls
-    (own class / inherited), this.method(...), super.method(...),
-    ClassName.staticMethod(...), and calls on a method parameter whose declared type is
-    a known class. Calls made through local variables, chained calls, or other classes
-    defined later in the file (forward references) are not tracked and are silently
-    skipped rather than raising a false positive.
-    """
     if not ownerAsInterface:
         source = memory
     else:
@@ -242,8 +220,7 @@ def hasCheckedAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterfa
     bodyParser.parse()
     tokens = bodyParser.get()
 
-    # --- Pass 1: find try-block ranges and the exception types their catch clauses cover ---
-    protectedRanges = []  # list of (start, end, set_of_types)
+    protectedRanges = []
     i = 0
     while i < len(tokens):
         if tokens[i].get()['type'] == 'TRY':
@@ -2064,8 +2041,6 @@ def validateInterfaceImplementation(className: str, interfaceName: str):
                     break
                 
                 if matching is None:
-                    # No overload satisfies this abstract method; surface a meaningful error
-                    # using the first overload for context, matching prior single-method behavior.
                     class_method = classOverloads[0]
                     if class_method.get('abstract', True) or not class_method.get('body'):
                         raise TypeError(f"Method '{method_name}' in class '{className}' cannot be abstract")
@@ -4025,7 +4000,10 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
         for mArgId in range(len(mArgTypes)):
             isConsistentTypes(args[mArgId], mArgTypes[mArgId])
             args[mArgId] = coerceValue(args[mArgId], mArgTypes[mArgId])
-        pushFrame(methodName, found_class, thisRef or newObject(found_class), args)
+        if found_method.get('static', False):
+            pushFrame(methodName, found_class, None, args)
+        else:
+            pushFrame(methodName, found_class, thisRef or newObject(found_class), args)
 
         mModifier = mInfo['modifier']
         thisScope = perspectiveOfClass(caller, found_class)
