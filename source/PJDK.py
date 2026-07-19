@@ -26,6 +26,8 @@ class Numeric:
         return type(cls).__name__.lower()
 class Returnable: # Base class in class hierachy for anything that a method could return
     pass
+class Nullable:
+    pass
 
 def toSigned(value: int, bits: int) -> int:
     mask = (1 << bits) - 1
@@ -47,28 +49,28 @@ class _IntegerBase(Numeric, Returnable):
     def get(self):
         return self.value
 
-class Byte(_IntegerBase):
+class Byte(_IntegerBase, Nullable):
     bits = 8
     @classmethod
     def get_bits(cls):
         return cls.bits
-class Short(_IntegerBase):
+class Short(_IntegerBase, Nullable):
     bits = 16
     @classmethod
     def get_bits(cls):
         return cls.bits
-class Int(_IntegerBase):
+class Int(_IntegerBase, Nullable):
     bits = 32
     @classmethod
     def get_bits(cls):
         return cls.bits
-class Long(_IntegerBase):
+class Long(_IntegerBase, Nullable):
     bits = 64
     @classmethod
     def get_bits(cls):
         return cls.bits
 
-class Double(Numeric, Returnable):
+class Double(Numeric, Returnable, Nullable):
     bits = 64
     def __init__(self, value: float = 0.0):
         if isinstance(value, (Float, Double)):
@@ -80,7 +82,7 @@ class Double(Numeric, Returnable):
     def get(self): return self.value
     def to_bytes(self): return struct.pack('>d', self.value)
     def __repr__(self): return f"Double({self.value})"
-class Float(Numeric, Returnable):
+class Float(Numeric, Returnable, Nullable):
     bits = 32
     @classmethod
     def get_bits(cls):
@@ -93,7 +95,7 @@ class Float(Numeric, Returnable):
     def to_bytes(self): return struct.pack('>f', self.value)
     def __repr__(self): return f"Float({self.value})"
 
-class Bool(Returnable):
+class Bool(Returnable, Nullable):
     def __init__(self, value: bool):
         self.value = value
     def get(self):
@@ -101,26 +103,28 @@ class Bool(Returnable):
     def __repr__(self):
         return f"Bool({self.value})"
 
-class String(Returnable):
+class String(Returnable, Nullable):
     def __init__(self, value: str):
         self.value = value
     def get(self):
         return self.value
     def __repr__(self):
         return f"{self.value}"
-class Char(Returnable):
+class Char(Returnable, Nullable):
     def __init__(self, value: str):
         self.value = value[0]
     def get(self):
         return self.value
     def __repr__(self):
         return f"Char({self.value})"
-class Void(Returnable):
+class Void(Returnable, Nullable):
     def __repr__(self):
         return "Void"
 class Null():
     def __repr__(self):
         return "Null"
+    def get(self):
+        return None
 class ExceptionValue(Returnable):
     """Wraps a caught Python exception so DSL code can call e.getMessage() on it,
     while still behaving like a String (via get()) for concatenation/printing."""
@@ -142,7 +146,7 @@ class ClassReference(Returnable):
     def getClass(self):
         _ = self.get() # Ensures the ClassReference points to something, before dispensing address
         return self.className
-class ClassType(Returnable):
+class ClassType(Returnable, Nullable):
     def __init__(self, className: str):
         self.className = className
     def get(self):
@@ -164,15 +168,20 @@ def isAllowedAtThisScope(modifier: str, thisScope: str, isInterface: bool = Fals
         return True
     raise PermissionError('Attempted to access a field or method without sufficient permission')
 def isConsistentTypes(thisType: object, otherType: object) -> bool:
+    if isinstance(otherType, Null) or otherType is Null and issubclass(thisType, Nullable):
+        return True
+    if isinstance(thisType, Null) or thisType is Null and issubclass(otherType, Nullable):
+        return True
+
     if isinstance(thisType, ClassType) or thisType is ClassType or thisType is ClassReference:
         if isinstance(otherType, ObjectReference) or otherType is ObjectReference:
             if not (otherType.getClass() == thisType.className or thisType.className in getHierarchyOfClass(otherType.getClass())):
-                raise Exception(f'Class {otherType.getClass()} does not support class {thisType.className}')
+                raise TypeError(f'Class {otherType.getClass()} does not support class {thisType.className}')
             return True 
     elif isinstance(thisType, ObjectReference) or thisType is ObjectReference:
         if isinstance(otherType, ClassType) or otherType is ClassType:
             if not (thisType.getClass() == otherType.className or otherType.className in getHierarchyOfClass(thisType.getClass())):
-                raise Exception(f'Class {otherType.className} does not support class {thisType.getClass()}')
+                raise TypeError(f'Class {otherType.className} does not support class {thisType.getClass()}')
             return True
     if thisType is otherType:
         return True
@@ -186,9 +195,9 @@ def isConsistentTypes(thisType: object, otherType: object) -> bool:
         if issubclass(thisType, _IntegerBase) and issubclass(otherType, _IntegerBase) and thisType.bits == otherType.bits:
             return True
     except TypeError:
-        raise Exception(f'Type {otherType.__name__} does not support type {thisType.__name__}')
+        raise TypeError(f'Type {otherType.__name__} does not support type {thisType.__name__}')
     
-    raise Exception(f'Type {otherType.__name__} does not support type {thisType.__name__}')
+    raise TypeError(f'Type {otherType.__name__} does not support type {thisType.__name__}')
 def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterface: bool = False):
     """
     Static (parse-time) check: for every call inside <thisMethodName>'s body to another
@@ -829,7 +838,7 @@ class ArrayAssignment:
                 raise SyntaxError("Expected ';' after array declaration")
             pos += 1
             array_value = Expression.evaluate(me, methodArgs, rhs_tokens)
-            if not isinstance(array_value, PrimitiveArray):
+            if not isinstance(array_value, (PrimitiveArray, Null)):
                 raise RuntimeError(f"Cannot assign non-array value to array variable '{var_name}'")
             if declared_size is not None and array_value.size != declared_size:
                 raise RuntimeError(
@@ -1387,8 +1396,11 @@ def toRPN(tokens: TokenSlice) -> TokenSlice:
         t = tok.get()['type']
         if t in ('RESOLVED_VALUE', 'INT_LITERAL', 'LONG_LITERAL', 'BYTE_LITERAL',
                  'SHORT_LITERAL', 'FLOAT_LITERAL', 'DOUBLE_LITERAL', 'STRING_LITERAL',
-                 'IDENTIFIER', 'TRUE', 'FALSE'):
-            output.append(tok)
+                 'IDENTIFIER', 'TRUE', 'FALSE', 'NULL'):
+            if t == 'NULL':
+                output.append(Null())
+            else:
+                output.append(tok)
             continue
         
         if t == 'LPAREN':
@@ -1842,7 +1854,7 @@ def resolveValue(me: StackFrame | None, methodArgs: list | None, tok: Token):
     if foundRetValue is None:
         raise RuntimeError(f"'{name}' could not be resolved locally, statically or non-statically, in context of Class '{me.class_name}'")
     elif isinstance(foundRetValue, Null):
-        raise RuntimeError(f'NullPointerException: {tok}')
+        raise RuntimeError(f'Variable "{tok.get()['val']}" might not have been initialized')
     else:
         return foundRetValue
 def resolveOperand(me: StackFrame | None, methodArgs: list | None, tok: Token | str):
@@ -1933,7 +1945,6 @@ def resolveOperand(me: StackFrame | None, methodArgs: list | None, tok: Token | 
 def convertValue(value: object, target_type: object, allowLossy: bool = False) -> object:
     if isinstance(value, target_type):
         return value
-
     if isinstance(target_type, type) and issubclass(target_type, Numeric) and isinstance(value, Numeric):
         raw = value.get()
         if hasattr(value, 'bits'):
@@ -1952,6 +1963,8 @@ def convertValue(value: object, target_type: object, allowLossy: bool = False) -
             return String(str(value))
         else:
             return String(str(value))
+    if type(value) is Null:
+        return type(target_type)(Null())
     raise TypeError(f"Cannot convert {type(value).__name__} to {target_type.__name__}")
 def coerceValue(value: object, target_type: object) -> object:
     if not isinstance(target_type, type) or not issubclass(target_type, Numeric):
@@ -2011,8 +2024,12 @@ class Expression:
         assumeType = forceType
 
         for tok in toRPN(tokens):
-            t = tok.get()['type']
-            
+
+            t = tok.get()
+            if t is None:
+                t = None
+            else:
+                t = t['val']
             if t == 'LONG_LITERAL':
                 assumeType = 'long'
             elif t == 'BYTE_LITERAL':
@@ -2349,7 +2366,7 @@ class Method:
                 assignToClass = ClassReference(tok_val) if isClassAssign else None
                 LocalAssignment.assign(self.me, self.args, [tok_val, var_name], self.read(self.peek(2), ';'), assignToClass)
             elif self.next(1) == ';':
-                self.me.setLocal(var_name, parseTokenAsType(tok_val), default_value_for_type(parseTokenAsType(tok_val)))
+                self.me.setLocal(var_name, parseTokenAsType(tok_val), Null())
             return False
         elif (tok_type in RETURN_TYPES or isClass(tok_val)) and self.peek().get()['type'] == 'LBRACKET':
             result = ArrayAssignment.parse(self.lang, self.tokPosition, tok_type, self.me, self.args)
@@ -2594,6 +2611,55 @@ class Method:
             var_name = tok_val
             self.tokPosition += 2 
 
+            if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'NEW':
+                self.tokPosition -= 2 
+                var_info = self.me.getLocal(var_name, Null(), True)
+                if var_info:
+                    var_type = var_info['type']
+                    if isinstance(var_type, PrimitiveArrayWrapper):
+                        element_type = var_type.getArrayType()
+                        pos = self.tokPosition + 2
+                        # Skip 'new'
+                        pos += 1
+                        # Skip type
+                        if pos < len(self.lang):
+                            pos += 1
+                        # Skip '['
+                        if pos < len(self.lang) and self.lang[pos].get()['type'] == 'LBRACKET':
+                            pos += 1
+                        # Skip ']'
+                        if pos < len(self.lang) and self.lang[pos].get()['type'] == 'RBRACKET':
+                            pos += 1
+                        # at '{'
+                        if pos < len(self.lang) and self.lang[pos].get()['type'] == 'START_DECLARATION':
+                            pos += 1
+                            values = []
+                            while pos < len(self.lang) and self.lang[pos].get()['type'] != 'END_DECLARATION':
+                                if self.lang[pos].get()['type'] == 'COMMA':
+                                    pos += 1
+                                    continue
+                                value_tokens = []
+                                while pos < len(self.lang):
+                                    t = self.lang[pos]
+                                    if t.get()['type'] == 'END_DECLARATION':
+                                        break
+                                    if t.get()['type'] == 'COMMA':
+                                        break
+                                    value_tokens.append(t)
+                                    pos += 1
+                                if value_tokens:
+                                    val = Expression.evaluate(self.me, self.args, value_tokens)
+                                    values.append(coerceValue(val, element_type))
+                            # Skip '}'
+                            pos += 1
+                            # Skip ';'
+                            if pos < len(self.lang) and self.lang[pos].get()['type'] == 'SEMICOLON':
+                                pos += 1
+                            array_value = newPrimitiveArray(element_type, len(values), values)
+                            self.me.changeLocal(var_name, array_value)
+                            self.tokPosition = pos
+                            return False
+            
             rhs_tokens = []
             while self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
                 rhs_tokens.append(self.lang[self.tokPosition])
@@ -3310,7 +3376,7 @@ class Execution:
                 prev_token = self.lang[self.tokPosition - 1]
                 if prev_token.get()['type'] == 'NEW':
                     is_constructor_call = True
-            if self.tokPosition >= 1: # Is this a constructore / "new"?
+            if self.tokPosition >= 1: # Is this a constructor / "new"?
                 prev_token = self.lang[self.tokPosition - 1]
                 if prev_token.get()['type'] == 'NEW':
                     is_constructor_call = True
