@@ -3883,11 +3883,15 @@ if fileName == '.txt':
     fileName = 'Test.txt'
 oldContent = ''
 while choice == 'Retry':
-    try:
-        content = (Path(__file__).parent / fileName).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        print(f'[WARNING]: The file was not found in directory {Path(__file__).parent}')
-        fileName = (input('Enter file name: ') + '.txt')
+    foundFile = False
+    while not foundFile:
+        try:
+            content = (Path(__file__).parent / fileName).read_text(encoding="utf-8")
+            foundFile = True 
+            continue
+        except FileNotFoundError:
+            print(f'[WARNING]: The file {fileName} was not found in directory {Path(__file__).parent}')
+            fileName = (input('Enter file name: ') + '.txt')
     os.system('cls')
     if oldContent == content:
         print(f'[WARNING]: File reloading did not detect any changes in file. Did you save the file {fileName}?')
