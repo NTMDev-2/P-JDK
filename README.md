@@ -1,5 +1,5 @@
 # Python-JDK
-PJDK is an interesting and cool replica of the popular Java programming language by Oracle (originally by Sun Microsystems), created inside Python! (Also supports the C `unsigned` keyword since I think its important)
+PJDK is an interesting and cool replica of the popular Java programming language by Oracle (originally by Sun Microsystems), created inside Python!
 
 To play with P-JDK, the source code is presented inside source/PJDK.py. Download it, and it requires Python 3.12+ Intepreter to run. 
 
