@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+import builtins
 from typing import Any#, Optional
 import operator as pyop
 from pathlib import Path
@@ -147,6 +148,16 @@ class Void(Returnable):
 class Null():
     def __repr__(self):
         return "Null"
+class ExceptionValue(Returnable):
+    """Wraps a caught Python exception so DSL code can call e.getMessage() on it,
+    while still behaving like a String (via get()) for concatenation/printing."""
+    def __init__(self, excType: type, message: str):
+        self.excType = excType
+        self.message = message
+    def get(self):
+        return self.message
+    def __repr__(self):
+        return self.message
 
 class ClassReference(Returnable):
     def __init__(self, className):
@@ -170,9 +181,11 @@ def isAllowedAtThisScope(modifier: str, thisScope: str, isInterface: bool = Fals
     isValidModifier(modifier)
     if isInterface:
         return True
-    if thisScope == "this":
+    if thisScope == 'this':
         return True
-    if modifier == "public":
+    if modifier == 'public':
+        return True
+    if modifier == "default": # This will have "isSamePackage" check later
         return True
     if modifier == "protected" and thisScope == "subclass":
         return True
@@ -267,7 +280,7 @@ def hasCheckdAllExeceptions(ownerName: str, thisMethodName: str, ownerAsInterfac
                     scan += 1
                 if scan < len(tokens) and tokens[scan].get()['type'] == 'IDENTIFIER':
                     excName = tokens[scan].get()['val']
-                    excType = getattr(__builtins__, excName, object)
+                    excType = getattr(builtins, excName, object)
                     if isinstance(excType, type) and issubclass(excType, (Exception, Warning)):
                         coveredTypes.add(excType)
                     scan += 1
@@ -368,7 +381,7 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
         for thisIface in [ifaceName] + getHierarchyOfInterface(ifaceName):
             iface_info = interfaces[thisIface]
             for m_name, m_body in iface_info['methods'].items():
-                if m_name not in inherited and m_body.get('body'):
+                if m_body.get('abstract', True) and m_name not in inherited:
                     inherited[m_name] = {
                         'name': m_body['name'],
                         'modifier': m_body['modifier'],
@@ -376,7 +389,18 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
                         'static': False,
                         'args': m_body['args'],
                         'throws': m_body.get('throws', []),
+                        'abstract': True
+                    }
+                elif not m_body.get('abstract', True) and m_name not in inherited and m_body.get('body'):
+                    inherited[m_name] = {
+                        'name': m_body['name'],
+                        'modifier': m_body['modifier'],
+                        'returns': m_body['returns'],
+                        'static': m_body.get('static', False),
+                        'args': m_body['args'],
+                        'throws': m_body.get('throws', []),
                         'body': m_body['body'],
+                        'abstract': False
                     }
 
     memory[className] = {
@@ -449,7 +473,6 @@ def setInterfaceMethod(interfaceName: str, methodName: str, methodReturnType: ob
     isValidReturnType(methodReturnType)
     isValidModifier(methodModifier)
     interfaceInfo = interfaces.get(interfaceName, {})
-    print(f'[WARNING]: {methodName} is presumed to be not abstract and requires a method body in the current release.')
     interfaceInfo['methods'][methodName] = {
         'name': methodName,
         'modifier': methodModifier,
@@ -769,6 +792,7 @@ class EvalTokens():
         "interface": "INTERFACE",
         "extends": "EXTENDS",
         "implements": "IMPLEMENTS",
+        'abstract': 'ABSTRACT',
         "new": "NEW",
         "return": "RETURN",
         "void": "VOID",
@@ -988,6 +1012,7 @@ class Intepreter():
         value = ""
         start_line = self.line
         start_col = self.column
+        has_decimal_point = False
         is_float = False
         is_double = False
         is_long = False
@@ -997,7 +1022,7 @@ class Intepreter():
             value += self.getCharAt()
             self.advance()
         if self.position < len(self.fileCode) and self.getCharAt() == '.':
-            is_float = True
+            has_decimal_point = True
             value += self.getCharAt()
             self.advance()
             if self.position < len(self.fileCode) and self.getCharAt().isdigit():
@@ -1020,34 +1045,33 @@ class Intepreter():
                         self.advance()
                 else:
                     raise SyntaxError(f"Expected exponent digits at line {start_line}, column {start_col}")
+        suffix = ''
         if self.position < len(self.fileCode):
             suffix = self.getCharAt()
             if suffix in ['L', 'l']:
-                if is_float:
+                if has_decimal_point or has_exponent:
                     raise SyntaxError(f"Cannot use 'L' suffix on floating-point number at line {start_line}")
                 is_long = True
                 value += suffix
                 self.advance()
             elif suffix in ['F', 'f']:
-                if not is_float and not has_exponent:
-                    is_float = True
                 is_float = True
                 is_double = False
                 value += suffix
                 self.advance()
             elif suffix in ['D', 'd']:
-                if not is_float and not has_exponent:
-                    is_double = True
                 is_double = True
                 is_float = False
                 value += suffix
                 self.advance()
+            else:
+                suffix = ''
         
         if is_long:
             self.add(Token('LONG_LITERAL', value, start_line, start_col, self.position))
         elif is_float:
             self.add(Token('FLOAT_LITERAL', value, start_line, start_col, self.position))
-        elif is_double or (is_float and not suffix):
+        elif is_double or ((has_decimal_point or has_exponent) and not suffix):
             self.add(Token('DOUBLE_LITERAL', value, start_line, start_col, self.position))
         else:
             self.add(Token('INT_LITERAL', value, start_line, start_col, self.position))
@@ -1445,13 +1469,24 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                 j = closeIdx + 1
             elif isInterface(className):
                 method_info = interfaces[className]['methods'][memberName]
-                thisScope = perspectiveOfClass(callerClass, className)
-                isAllowedAtThisScope(method_info['modifier'], thisScope)
+                if method_info.get('modifier') not in ['public', 'default']:
+                    # Only check if it's not public/default (which shouldn't happen for interfaces)
+                    thisScope = perspectiveOfClass(callerClass, className)
+                    isAllowedAtThisScope(method_info['modifier'], thisScope, isInterface=True)
                 current = invokeMethod(className, memberName, evaledArgs, caller=callerClass, thisRef=None, isInterfaceMethod=True)
                 j = closeIdx + 1
             else:
                 raise RuntimeError(f"Static method '{memberName}' not found in class '{className}'")
         
+        elif isinstance(current, ExceptionValue):
+            if memberName == 'getMessage' and isCall:
+                openParenIdx = j + 2
+                closeIdx = matchingParen(tokens, openParenIdx)
+                current = String(current.message)
+                j = closeIdx + 1
+                continue
+            else:
+                raise RuntimeError(f"Exception value has no member '{memberName}'")
         else:
             raise RuntimeError(f"Cannot access '.{memberName}' on value: {current!r}")
 
@@ -1552,6 +1587,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                 # In collapseTokenSlice, around line 1445-1455:
         elif t == 'IDENTIFIER' and i + 1 < len(tokens) and tokens[i+1].get()['type'] == 'LPAREN':
             methodName = tokens[i].get()['val']
+            method_handled = False
             if me is not None:
                 method_info = memory.get(me.class_name, {}).get('methods', {}).get(methodName)
                 if method_info and method_info.get('static', False):
@@ -1565,6 +1601,25 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                     result = invokeMethod(me.class_name, methodName, evaled_args, caller=me.class_name)
                     out.append(Token.wrap(result))
                     i = close_paren + 1
+                    method_handled = True
+                    continue
+
+                if method_info and not method_info.get('static', False) and me.this is not None:
+                    # Unqualified instance method call (implicit 'this.method()') -- this also
+                    # covers interface default methods calling other instance methods unqualified,
+                    # since default method bodies are copied into the implementing class's own
+                    # 'methods' table with 'this' bound to the actual instance.
+                    open_paren = i + 1
+                    close_paren = matchingParen(tokens, open_paren)
+
+                    arg_tokens = tokens[open_paren + 1 : close_paren]
+                    arg_groups = Token.splitArgs(arg_tokens)
+                    evaled_args = [Expression.evaluate(me, methodArgs, group) for group in arg_groups]
+
+                    result = invokeMethod(me.class_name, methodName, evaled_args, caller=me.class_name, thisRef=me.this)
+                    out.append(Token.wrap(result))
+                    i = close_paren + 1
+                    method_handled = True
                     continue
                 
                 if me.class_name in interfaces:
@@ -1582,6 +1637,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                             result = invokeMethod(me.class_name, methodName, evaled_args, caller=me.class_name, isInterfaceMethod=True)
                             out.append(Token.wrap(result))
                             i = close_paren + 1
+                            method_handled = True
                             continue
                 
                 if hasattr(me, 'class_name') and me.class_name in interfaces:
@@ -1599,10 +1655,13 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                                 result = invokeMethod(iface_name, methodName, evaled_args, caller=me.class_name, isInterfaceMethod=True)
                                 out.append(Token.wrap(result))
                                 i = close_paren + 1
+                                method_handled = True
                                 break
             
-            out.append(tokens[i])
-            i += 1
+            if not method_handled:
+                out.append(tokens[i])
+                i += 1
+            continue
         elif t == 'IDENTIFIER':
             if i + 1 < len(tokens) and tokens[i + 1].get()['type'] == 'LPAREN':
                 out.append(tokens[i])
@@ -1781,17 +1840,22 @@ def validateInterfaceImplementation(className: str, interfaceName: str):
         interface_info = interfaces[thisIface]
 
         for method_name, method_def in interface_info['methods'].items():
-
-            if method_name not in class_info['methods'] and interface_info['methods'][method_name]['abstract']:
-                raise NotImplementedError(f"Class '{className}' does not implement method '{method_name}' from interface '{thisIface}'")
+            if not method_def.get('abstract', True):
+                continue
+            
+            if method_name not in class_info['methods']:
+                raise NotImplementedError(f"Class '{className}' does not implement abstract method '{method_name}' from interface '{thisIface}'")
 
             try:
                 class_method = class_info['methods'][method_name]
+                if class_method.get('abstract', True) or not class_method.get('body'):
+                    raise TypeError(f"Method '{method_name}' in class '{className}' cannot be abstract")
+                
                 if class_method['returns'] != method_def['returns']:
                     raise TypeError(
                         f"Return type mismatch for '{method_name}': "
-                        f"interface expects {method_def['returns']}, "
-                        f"class provides {class_method['returns']}"
+                        f"interface expects {method_def['returns'].__name__}, "
+                        f"class provides {class_method['returns'].__name__}"
                     )
             except KeyError:
                 continue
@@ -2006,11 +2070,14 @@ class Method:
             self.isInterfaceMethod = True
         else:
             raise NameError(f"Class/Interface '{self.className}' not found")
-        self.methodBody = self.methodInfo['body']
+        
+        if self.methodInfo.get('abstract', False):
+            raise RuntimeError(f"Cannot execute abstract method '{self.methodName}'")
+        
+        self.methodBody = self.methodInfo.get('body', '')
         self.tokPosition = 0
-
         self.isInLoop = False
-        self.forLocalVar = {} # 'name', 'type', 'value'
+        self.forLocalVar = {}
     def read(self, token: Token, character: str) -> TokenSlice:
         startRead = self.lang.index(token)
         endRead = startRead
@@ -2444,6 +2511,18 @@ class Method:
                         if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
                             self.tokPosition += 1
                         return False
+                    elif self.me.this is not None:
+                        invokeMethod(
+                            self.me.class_name,
+                            methodName,
+                            evaledArgs,
+                            caller=self.me.class_name,
+                            thisRef=self.me.this
+                        )
+                        self.tokPosition = closeIdx + 1
+                        if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                            self.tokPosition += 1
+                        return False
                     else:
                         raise RuntimeError(f"Cannot call non-static method \"{methodName}\" in static context")
             if self.me.class_name in interfaces:
@@ -2455,6 +2534,19 @@ class Method:
                             methodName,
                             evaledArgs,
                             caller=self.me.class_name,
+                            isInterfaceMethod=True
+                        )
+                        self.tokPosition = closeIdx + 1
+                        if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
+                            self.tokPosition += 1
+                        return False
+                    elif self.me.this is not None:
+                        invokeMethod(
+                            self.me.class_name,
+                            methodName,
+                            evaledArgs,
+                            caller=self.me.class_name,
+                            thisRef=self.me.this,
                             isInterfaceMethod=True
                         )
                         self.tokPosition = closeIdx + 1
@@ -2660,7 +2752,7 @@ class Method:
             if self.tokPosition >= len(self.lang) or self.lang[self.tokPosition].get()['type'] != 'IDENTIFIER':
                 raise SyntaxError("Expected exception type name after 'throw new'")
             excName = self.lang[self.tokPosition].get()['val']
-            excType = getattr(__builtins__, excName, object)
+            excType = getattr(builtins, excName, object)
             if not (isinstance(excType, type) and issubclass(excType, (Exception, Warning))):
                 raise NameError(f'Invalid exception "{excName}"')
             self.tokPosition += 1
@@ -2692,7 +2784,7 @@ class Method:
                 if scan >= len(self.lang) or self.lang[scan].get()['type'] != 'IDENTIFIER':
                     raise SyntaxError("Expected exception type in 'catch'")
                 excName = self.lang[scan].get()['val']
-                excType = getattr(__builtins__, excName, object)
+                excType = getattr(builtins, excName, object)
                 if not (isinstance(excType, type) and issubclass(excType, (Exception, Warning))):
                     raise NameError(f'Invalid exception type "{excName}" in catch clause')
                 scan += 1
@@ -2726,7 +2818,7 @@ class Method:
                 for clause in catch_clauses:
                     if isinstance(caughtExc, clause['type']):
                         handled = True
-                        self.me.setLocal(clause['var'], String, String(str(caughtExc)))
+                        self.me.setLocal(clause['var'], ExceptionValue, ExceptionValue(clause['type'], str(caughtExc)))
                         self.tokPosition = clause['start']
                         control_signal = self.executeBlock()
                         del self.me.locals[clause['var']]
@@ -3185,6 +3277,9 @@ class Execution:
             elif tok_type == EvalTokens.TOKENS['unsigned']:
                 self.states['UNSIGNED'] = True
                 self.info['readBy'] = self.info.get('readBy', 1) + 1
+            elif tok_type == EvalTokens.TOKENS['abstract']:
+                self.states['ABSTRACT'] = True
+                self.info['readBy'] = self.info.get('readBy', 1) + 1
             elif tok_type in ACCESS_MODIFIERS: # Applies context: 'method_def', 'field_def'
                 self.mode.extend(['method_def', 'field_def'])
             elif tok_type in RETURN_TYPES and ('field_def' in self.mode or self.next(2) == '='): # FIELD
@@ -3282,7 +3377,7 @@ class Execution:
                 self.clear(noClearMode=True, noClearInfo=True)
                 continue
             elif tok_type == EvalTokens.TOKENS['('] and not is_constructor_call and self.before(2,'type') in (RETURN_TYPES + [EvalTokens.TOKENS['void']]): # METHOD
-                if 'method_def' in self.mode and not self.currentInterface:
+                if 'method_def' in self.mode and self.currentClass and not self.currentInterface:
                     # <modifier>, <static?>, <unsigned?>, <return_type>, <method_name> ( <...>
                     #       5         4          3             2              1        ^ WE ARE HERE  
                     self.mode = ['is_active_method_def', 'arg_def']
@@ -3319,6 +3414,7 @@ class Execution:
                             raise Exception(f'The {ENTRY_METHOD_NAME} method must not have more than 1 argument')
                     ENTRY['entryClass'] = self.currentClass
                 elif self.currentInterface:
+                    # Interface method definition
                     parseby = 1 if self.states['STATIC'] else 0
                     parseby += 1 if self.states['UNSIGNED'] else 0
                     args = argsList(self.handleArgumentDefinition())
@@ -3329,10 +3425,31 @@ class Execution:
                         methodModifier = 'default'
                     else:
                         isValidModifier(methodModifier)
-                    setInterfaceMethod(self.currentInterface, self.before(), methodReturnType, methodModifier, args, checkedExecs, False, self.states['STATIC']) # Assume it has a body
+                    
+                    # Check if this method has a body by looking ahead for '{'
+                    has_body = False
+                    scan_pos = self.tokPosition + 1
+                    while scan_pos < len(self.lang):
+                        t = self.lang[scan_pos]
+                        if t.get()['type'] == 'START_DECLARATION':
+                            has_body = True
+                            break
+                        elif t.get()['type'] in ('SEMICOLON', 'END_DECLARATION'):
+                            break
+                        scan_pos += 1
+                    
+                    isAbstract = not has_body
+                    isStatic = self.states['STATIC']
+                    
+                    setInterfaceMethod(self.currentInterface, self.before(), methodReturnType, methodModifier, args, checkedExecs, isAbstract, isStatic)
                     self.clear(noClearMode=True, noClearInfo=True)
-                    self.mode = ['is_active_method_def', 'method_body']
-                    self.info['thisMethodName'] = self.before()
+                    
+                    if has_body:
+                        self.mode = ['is_active_method_def', 'method_body']
+                        self.info['thisMethodName'] = self.before()
+                    else:
+                        self.mode = []
+                        self.info['thisMethodName'] = self.before()
             elif tok_type == EvalTokens.TOKENS[')']:
                 if self.info.get('parenStack', 0) == 0:
                     raise SyntaxError(f'Unexpected closing parenthesis at pos {token.getPos()["pos"]}')
@@ -3441,7 +3558,7 @@ class Execution:
         endRead = self.tokPosition + len(self.read(currentToken, '{'))
         parsed_as_str = [a.get()['val'] for a in self.lang[startRead:endRead]]
         if len(parsed_as_str) > 0 and parsed_as_str[0] != 'throws':
-            raise SyntaxError('Expected \'throws\' statement to start Exception list')
+            return []
         exceptions = []
         for token in self.lang[startRead+1:endRead]: # Skip the 'throws'
             if token.get()['val'] == ',':
@@ -3449,13 +3566,16 @@ class Execution:
             exceptions.append(token.get()['val'])
         parsed = []
         for e in exceptions:
-            thisExec = getattr(__builtins__, e, object)
+            thisExec = getattr(builtins, e, object)
             if not issubclass(thisExec, (Exception, Warning)):
                 raise NameError(f'Invalid exception "{e}"')
             parsed.append(thisExec)
         return parsed
     def handleNullFieldDefinition(self, _type: object, modifier: str, interface: bool = False):
-        setField(ClassReference(self.currentClass), self.next(), modifier, _type, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'], interface=interface)
+        if not interface:
+            setField(ClassReference(self.currentClass), self.next(), modifier, _type, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
+        else:
+            setInterfaceField(self.currentInterface, self.next, _type, default_value_for_type(_type))
     def handleMethodDefinition(self, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool, methodArgs: dict, throws: list = []):
         createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, isStatic, argsList(methodArgs), throws)
         self.clear(noClearMode=True, noClearInfo=True)
@@ -3491,9 +3611,12 @@ class Execution:
         endArgRead = self.lang[closeIndex].getPos()['pos']
         methodBody = self.langParse.getSource()[startArgRead:endArgRead]
         if not self.currentInterface:
-            memory[self.currentClass]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
+            if self.info['thisMethodName'] in memory[self.currentClass]['methods']:
+                memory[self.currentClass]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
+                memory[self.currentClass]['methods'][self.info['thisMethodName']]['abstract'] = False
         else:
             interfaces[self.currentInterface]['methods'][self.info['thisMethodName']]['body'] = methodBody.strip()
+            interfaces[self.currentInterface]['methods'][self.info['thisMethodName']]['abstract'] = False
         holder = self.currentClass if not self.currentInterface else self.currentInterface
         hasCheckdAllExeceptions(holder, self.info['thisMethodName'], not not self.currentInterface)
         self.tokPosition = closeIndex - 1
@@ -3507,7 +3630,7 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
         
         current = lookup_class
         while current is not None:
-            if current in memory and methodName in memory[current]['methods']:
+            if current in memory and methodName in memory[current].get('methods', {}):
                 found_method = memory[current]['methods'][methodName]
                 break
             if current in memory and 'super' in memory[current]:
@@ -3585,7 +3708,7 @@ while choice == 'Retry':
         Exec.executeTokens()
         try:
             if ENTRY['entryClass'] not in memory or ENTRY_METHOD_NAME not in memory[ENTRY['entryClass']]['methods']:
-                raise NameError(f'Could not resolve the entry method "{ENTRY_METHOD_NAME}". Please define it properly')
+                raise NameError(f'An unexpected error occured while resolving "{ENTRY_METHOD_NAME}"')
             entryArgTypes = list(memory[ENTRY['entryClass']]['methods'][ENTRY_METHOD_NAME]['args'].values())
             callArgs = []
             if entryArgTypes:
@@ -3600,9 +3723,9 @@ while choice == 'Retry':
             start = time.time()
             invokeMethod(ENTRY['entryClass'], ENTRY_METHOD_NAME, callArgs, caller=ENTRY['entryClass'])
             end = time.time()
-            print(f'[INFO]: Program exited, with duration of {round(end-start, 4)}s')
+            print(f'[INFO]: Program exited, with duration of {round(round(end-start, 6)*1000,2)}ms')
         except NameError:
-            raise NameError(f'Could not resolve the entry method "{ENTRY_METHOD_NAME}". Please define it properly')
+            raise NameError(f'An unexpected error occured while resolving "{ENTRY_METHOD_NAME}"')
     except Exception as e:
         for line in traceback.format_exception(e)[1:-1]:
             print(line.strip())
