@@ -153,7 +153,6 @@ class ClassType(Returnable, Nullable):
         return f"ClassType({self.className})"
 
 def isAllowedAtThisScope(modifier: str, thisScope: str, packageScope: str = 'this', isInterface: bool = False, item: str = '') -> bool:
-    print(not item)
     isValidModifier(modifier)
     if isInterface:
         return True
@@ -1315,7 +1314,7 @@ EvalTokens.TWO_CHAR_OP['<='], EvalTokens.SINGLE_CHAR_OP['!'], EvalTokens.TWO_CHA
 LOOP_ACTIONS = [EvalTokens.TOKENS['break'], EvalTokens.TOKENS['continue']]
 RETURN_TYPE_STR = ('String', 'char', 'byte', 'short', 'int', 'long')
 
-def parseTokenAsType(token: str, acceptVoid: bool = False) -> object:
+def parseTokenAsType(token: str, acceptVoid: bool = False, wantExact: bool = False) -> object:
     match token:
         case 'IDENTIFIER':
             return type(resolveOperand(None, None, token))
@@ -1345,6 +1344,8 @@ def parseTokenAsType(token: str, acceptVoid: bool = False) -> object:
             return String
         case _:
             if isClass(token):
+                if wantExact:
+                    return ClassType(token)
                 return ClassType
             else:
                 raise ValueError(f"Unknown type token: '{token}'")
@@ -1539,7 +1540,6 @@ def matchingBrace(tokens: TokenSlice, openIdx: int) -> int:
             depth -= 1
             if depth == 0:
                 return j
-        print(tt, depth)
         j += 1
     raise SyntaxError("Unmatched brace")
 
@@ -3900,7 +3900,7 @@ class Execution:
                 
                 try:
                     isValidReturnType(parseTokenAsType(arg_type_token))
-                    arg_type = parseTokenAsType(arg_type_token)
+                    arg_type = parseTokenAsType(arg_type_token, wantExact=True)
                 except ValueError:
                     if '[' in arg_type_token and ']' in arg_type_token:
                         base_type = arg_type_token.split('[')[0]
@@ -3910,10 +3910,9 @@ class Execution:
                         else:
                             raise RuntimeError(f'Could not resolve array type: {arg_type_token}')
                     elif isClass(arg_type_token):
-                        arg_type = ClassReference(arg_type_token)
+                        arg_type = ClassType(arg_type_token)
                     else:
                         raise RuntimeError(f'Could not resolve the argument stream: {arg}')
-                
                 self.info['thisMethodArgs'][arg_name] = arg_type
         return self.info['thisMethodArgs']
     def handleThrowStmt(self, currentToken: Token, argSize: int): # <method_name> (<args>) throws? <exceptions...>
@@ -4033,7 +4032,6 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
 
         mModifier = mInfo['modifier']
         thisScope = perspectiveOfClass(caller, found_class)
-        print(f"DEBUG: Checking {mInfo['name']} with modifier {mModifier}, thisScope={thisScope}, packageScope={packagePrespectiveOfClass(className, caller)}")
         isAllowedAtThisScope(mModifier, thisScope, packagePrespectiveOfClass(className, caller), item=mInfo['name'])
     else:
         if not isInterface(className):
