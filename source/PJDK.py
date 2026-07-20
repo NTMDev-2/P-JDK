@@ -17,7 +17,7 @@ ENTRY = {'entryClass': '', 'entryMethod': ENTRY_METHOD_NAME}
 nextHeapId = 0
 heap: dict = {}
 
-memory: dict = {'Object': {'name': 'Object', 'methods': {}, 'fields': {}}}
+memory: dict = {'Object': {'name': 'Object', 'methods': {}, 'fields': {}, 'package': 'MainRuntime'}}
 interfaces: dict = {}
 
 class Numeric:
@@ -152,19 +152,23 @@ class ClassType(Returnable, Nullable):
     def __repr__(self):
         return f"ClassType({self.className})"
 
-def isAllowedAtThisScope(modifier: str, thisScope: str, isInterface: bool = False) -> bool: 
+def isAllowedAtThisScope(modifier: str, thisScope: str, packageScope: str = 'this', isInterface: bool = False, item: str = '') -> bool:
+    print(not item)
     isValidModifier(modifier)
     if isInterface:
         return True
-    if thisScope == 'this':
+    elif thisScope == 'this':
         return True
-    if modifier == 'public':
+    elif modifier == 'public':
         return True
-    if modifier == "default": # This will have "isSamePackage" check later
+    elif modifier == "default" and packageScope == 'this': # This will have "isSamePackage" check later
         return True
-    if modifier == "protected" and thisScope in ('other', "subclass"):
+    elif modifier == "protected" and thisScope in ('other', "subclass") and packageScope == 'this':
         return True
-    raise PermissionError('Attempted to access a field, method, or constructor without sufficient permission')
+    elif not item:
+        raise PermissionError('Attempted to access a field, method, or constructor without sufficient permission')
+    else:
+        raise PermissionError(f'Attempted to access item "{item}" without sufficient permission')
 def isConsistentTypes(thisType: object, otherType: object) -> bool:
     if isinstance(otherType, Null) or otherType is Null and issubclass(thisType, Nullable):
         return True
@@ -326,7 +330,7 @@ def isValidReturnType(selftype: object):
 def isChangeable(data: dict):
     if data['final']:
         raise Exception(f'This variable "{data['name']}" is final, and therefore cannot be modified')
-def createClass(className: str, classModifier: str, superClass: ClassReference = ClassReference('Object'), implements: list[str] = []):
+def createClass(className: str, classModifier: str, package: str, superClass: ClassReference = ClassReference('Object'), implements: list[str] = []):
     isValidModifier(classModifier)
     if className in memory:
         raise NameError(f"Class '{className}' is already defined")
@@ -357,7 +361,8 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
                         'static': False,
                         'args': m_body['args'],
                         'throws': m_body.get('throws', []),
-                        'abstract': True
+                        'abstract': True,
+                        'package': package
                     }
                 elif not m_body.get('abstract', True) and m_name not in inherited and m_body.get('body'):
                     inherited[m_name] = {
@@ -368,7 +373,8 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
                         'args': m_body['args'],
                         'throws': m_body.get('throws', []),
                         'body': m_body['body'],
-                        'abstract': False
+                        'abstract': False,
+                        'package': package
                     }
 
     memory[className] = {
@@ -377,9 +383,10 @@ def createClass(className: str, classModifier: str, superClass: ClassReference =
         'implements': implements,
         'modifier': classModifier,
         'methods': inherited,
-        'fields': inherited_fields
+        'fields': inherited_fields,
+        'package': package
     }
-def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool = False, methodArgs: dict = {}, throws: list = []):
+def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, package: str, isStatic: bool = False, methodArgs: dict = {}, throws: list = []):
     isValidReturnType(methodReturnType)
     isValidModifier(methodModifier)
     classInfo = memory[thisClass.getClass()]
@@ -409,7 +416,8 @@ def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str
             'returns': methodReturnType,
             'static': isStatic,
             'args': methodArgs,
-            'throws': throws
+            'throws': throws,
+            'package': package
         }
         existing.append(new_method)
         methodInfo[methodName] = existing
@@ -420,7 +428,8 @@ def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str
             'returns': methodReturnType,
             'static': isStatic,
             'args': methodArgs,
-            'throws': throws
+            'throws': throws,
+            'package': package
         }
     
     if isStatic:
@@ -429,9 +438,10 @@ def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str
             'name': methodName,
             'modifier': methodModifier,
             'returns': methodReturnType,
-            'args': methodArgs
+            'args': methodArgs,
+            'package': package
         }
-def createConstructor(className: str, modifier: str, body: str, args: dict = {}):
+def createConstructor(className: str, modifier: str, package: str, body: str, args: dict = {}):
     isValidModifier(modifier)
     if 'constructor' not in memory[className]:
         memory[className]['constructor'] = []
@@ -442,6 +452,7 @@ def createConstructor(className: str, modifier: str, body: str, args: dict = {})
         'modifier': modifier,
         'args': args, 
         'body': body,
+        'package': package,
         'constructor': True
     }
     )
@@ -456,15 +467,16 @@ def argsList(args: dict[str, object]) -> dict: # This sets and compiles an argum
             continue
     return args
 
-def createInterface(interfaceName: str, superInterfaces: list[str] = []):
+def createInterface(interfaceName: str, package: str, superInterfaces: list[str] = []):
     if isInterface(interfaceName):
         raise NameError(f'Interface {interfaceName} is already defined')
     interfaces[interfaceName] = {
         'name': interfaceName,
         'super': superInterfaces,
         'methods': {},
+        'package': package
     }
-def setInterfaceField(interfaceName: str, fieldName: str, fieldType: object, initialValue: object = None):
+def setInterfaceField(interfaceName: str, fieldName: str, fieldType: object, package: str, initialValue: object = None):
     if not isInterface(interfaceName):
         raise NameError(f"Interface '{interfaceName}' does not exist")
     
@@ -482,9 +494,10 @@ def setInterfaceField(interfaceName: str, fieldName: str, fieldType: object, ini
         'type': fieldType,
         'value': converted_value,
         'final': True,
-        'isInterface': True # Special tag for interface fields
+        'isInterface': True, # Special tag for interface fields
+        'package': package
     }
-def setInterfaceMethod(interfaceName: str, methodName: str, methodReturnType: object, methodModifier: str, methodArgs: dict = {}, throws: list = [], isAbstract: bool = True, isStatic: bool = False):
+def setInterfaceMethod(interfaceName: str, methodName: str, methodReturnType: object, methodModifier: str, package: str, methodArgs: dict = {}, throws: list = [], isAbstract: bool = True, isStatic: bool = False):
     isValidReturnType(methodReturnType)
     isValidModifier(methodModifier)
     interfaceInfo = interfaces.get(interfaceName, {})
@@ -495,7 +508,8 @@ def setInterfaceMethod(interfaceName: str, methodName: str, methodReturnType: ob
         'args': methodArgs,
         'throws': throws,
         'abstract': isAbstract,
-        'static': isStatic
+        'static': isStatic,
+        'package': package
     }
 
 def default_value_for_type(typ: object) -> object:
@@ -518,7 +532,7 @@ def default_value_for_type(typ: object) -> object:
     if typ is String:
         return String("")
     return Null()
-def setField(className: ClassReference, fieldName: str, fieldModifier: str, fieldType: object, initialValue: object = Null(), isStatic: bool = False, isFinal: bool = False):
+def setField(className: ClassReference, fieldName: str, fieldModifier: str, fieldType: object, package: str, initialValue: object = Null(), isStatic: bool = False, isFinal: bool = False):
     if isinstance(initialValue, Null):
         initialValue = default_value_for_type(fieldType)
     isValidModifier(fieldModifier)
@@ -530,7 +544,8 @@ def setField(className: ClassReference, fieldName: str, fieldModifier: str, fiel
         'type': fieldType,
         'value': initialValue,
         'static': isStatic,
-        'final': isFinal
+        'final': isFinal,
+        'package': package,
     } # getField() is defined inside ObjectReference, as it needs an active, live class to know how the values are working.
     if isStatic:
         if staticVariables.get(thisName, 0) == 0:
@@ -541,7 +556,8 @@ def setField(className: ClassReference, fieldName: str, fieldModifier: str, fiel
             'modifier': fieldModifier,
             'type': fieldType,
             'value': initialValue,
-            'final': isFinal
+            'final': isFinal,
+            'package': package
         }
 
 class HeapInstance():
@@ -644,7 +660,7 @@ def newObject(class_name: str, constructorArgs: list = [], callerClass: str = ''
         obj_id = nextHeapId
         nextHeapId += 1
         heap[obj_id] = obj
-        isAllowedAtThisScope(matched_constructor['modifier'], perspectiveOfClass(class_name, callerClass))
+        isAllowedAtThisScope(matched_constructor['modifier'], perspectiveOfClass(class_name, callerClass), packagePrespectiveOfClass(class_name, callerClass), item=f"{class_name}<init>")
         pushFrame('<init>', class_name, ObjectReference(obj_id), constructorArgs)
         
         cons_method = Method()
@@ -1572,7 +1588,7 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
             if memberName in staticVariables.get(current, {}):
                 field_data = staticVariables[current][memberName]
                 thisScope = perspectiveOfClass(callerClass, current)
-                isAllowedAtThisScope(field_data['modifier'], thisScope, field_data.get('isInterface', False))
+                isAllowedAtThisScope(field_data['modifier'], thisScope, packagePrespectiveOfClass(me.class_name, callerClass), field_data.get('isInterface', False), field_data['name'])
                 current = field_data['value']
                 j += 2
                 continue
@@ -1612,7 +1628,8 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                 thisScope = perspectiveOfClass(callerClass, field_class)
                 # Check if field exists
                 if field_class in memory and memberName in memory[field_class]['fields']:
-                    isAllowedAtThisScope(memory[field_class]['fields'][memberName]['modifier'], thisScope)
+                    thisFieldInfo = memory[field_class]['fields'][memberName]
+                    isAllowedAtThisScope(thisFieldInfo['modifier'], thisScope, packagePrespectiveOfClass(me.class_name, callerClass), thisFieldInfo['name'])
                     current = current.get().fields.get(memberName, Null())
                 else:
                     raise RuntimeError(f"Field '{memberName}' not found in class '{field_class}'")
@@ -1632,7 +1649,7 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                     raise RuntimeError(f"Method '{memberName}' in class '{className}' is not static")
                 
                 thisScope = perspectiveOfClass(callerClass, className)
-                isAllowedAtThisScope(method_info['modifier'], thisScope)
+                isAllowedAtThisScope(method_info['modifier'], thisScope, packagePrespectiveOfClass(me.class_name, callerClass), method_info['name'])
                 current = invokeMethod(className, memberName, evaledArgs, caller=callerClass, thisRef=None)
                 j = closeIdx + 1
             elif isInterface(className):
@@ -1640,7 +1657,7 @@ def resolveDotChain(me: 'StackFrame | None', methodArgs: 'list | None', tokens: 
                 if method_info.get('modifier') not in ['public', 'default']:
                     # Only check if it's not public/default (which shouldn't happen for interfaces)
                     thisScope = perspectiveOfClass(callerClass, className)
-                    isAllowedAtThisScope(method_info['modifier'], thisScope, isInterface=True)
+                    isAllowedAtThisScope(method_info['modifier'], thisScope, packagePrespectiveOfClass(me.class_name, callerClass), True, method_info['name'])
                 current = invokeMethod(className, memberName, evaledArgs, caller=callerClass, thisRef=None, isInterfaceMethod=True)
                 j = closeIdx + 1
             else:
@@ -1729,6 +1746,9 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
         elif t == 'LPAREN' and i + 2 < len(tokens) and tokens[i+1].get()['type'] in RETURN_TYPES and tokens[i+2].get()['type'] == 'RPAREN' and (i == 0 or tokens[i-1].get()['type'] not in ('IDENTIFIER', 'RPAREN', 'RBRACKET')): # Casting
             # (<type>) <value> <...?>;
             castToType = tokens[i+1].get()['type']
+            castValue = tokens[i+1].get()['val']
+            if not isClass(castValue) or castToType not in RETURN_TYPES:
+                raise NameError(f'Could not cast to type {castValue}')
             i += 3 # skip (<type>)
             parenDepth = 0
             castValues = []
@@ -1745,7 +1765,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                     break
                 castValues.append(tok)
             castValue = Expression.evaluate(me, me.getArgs(), castValues)
-            finalCastValue = convertValue(castValue, parseTokenAsType(castToType), allowLossy=True)
+            finalCastValue = convertValue(castValue, ClassType(castValue) if isClass(castValue) else parseTokenAsType(castToType), allowLossy=True)
             out.append(Token.wrap(finalCastValue))
             i += len(castValues)
             continue
@@ -2001,7 +2021,7 @@ def convertValue(value: object, target_type: object, allowLossy: bool = False) -
             return String(str(value))
         else:
             return String(str(value))
-    if type(value) is Null:
+    if type(value) is Null:           
         return type(target_type)(Null())
     raise TypeError(f"Cannot convert {type(value).__name__} to {target_type.__name__}")
 def coerceValue(value: object, target_type: object) -> object:
@@ -2181,8 +2201,12 @@ def perspectiveOfClass(_class: str, _relativeToClass: str) -> str:
 
     if _relativeToClass in hierarchy:
         return 'subclass'
-    
+
     return 'other'
+def packagePrespectiveOfClass(_class: str, _relativeToClass: str) -> str:
+    if memory[_class]['package'] != memory[_relativeToClass]['package']:
+        return 'other'
+    return 'this'
 
 def getSuperOfInterface(interfaceName: str) -> list[str]:
     if not isInterface(interfaceName):
@@ -3375,7 +3399,7 @@ class Method:
         elif not hasReturned and self.methodInfo['returns'] is not Void:
             raise RuntimeError(f'No return statement in method "{self.methodName}"')
 class Execution:
-    def __init__(self, langParse: Intepreter):
+    def __init__(self, langParse: Intepreter, packageName: str):
         self.langParse: Intepreter = langParse
         self.langParse.parse()
         self.lang: TokenSlice = langParse.get()
@@ -3392,6 +3416,9 @@ class Execution:
         }
         self.currentClass: str = ''
         self.info: dict[str, Any] = {} # Memory for the parser
+        self.packageName = packageName
+
+        self.scope_stack = []
     def reset(self):
         global ENTRY, nextHeapId, heap, memory, staticMethods, staticVariables
         self.lang = []
@@ -3468,32 +3495,29 @@ class Execution:
                     self.handleMethodBodyContent(token)
                     if 'thisMethodArgs' in self.info:
                         del self.info['thisMethodArgs']
-                elif 'is_active_if_def' in self.mode:
-                    self.mode = ['is_active_if_def', 'if_body']
-                    #self.handleIfCall()
-                elif 'is_active_else_def' in self.mode:
-                    self.mode = ['is_active_else_def', 'else_body']
-                    #self.handleElseCall()
+                    self.scope_stack.append('method')
                 elif self.currentClass or self.currentInterface: # Classes do not contain "code", therefore just skip
-                    pass
+                    if self.currentInterface:
+                        self.scope_stack.append('interface')
+                    else:
+                        self.scope_stack.append('class')
                 else:
                     raise SyntaxError(f'Unexpected open brace at pos {token.getPos()}')
                 self.info['braceStack'] = self.info.get('braceStack', 0) + 1
             elif tok_type == EvalTokens.TOKENS['}']:
-                if self.info.get('braceStack', 0) == 0:
+                if len(self.scope_stack) == 0 or self.info.get('braceStack', 0) == 0:
                     raise SyntaxError(f'Unexpected closing brace at pos {token.getPos()["pos"]}')
                 self.info['braceStack'] -= 1
                 if 'is_active_method_def' in self.mode and 'method_body' in self.mode:
-                    self.mode = []
-                elif 'is_active_if_def' in self.mode and 'if_body' in self.mode:
-                    self.mode = []
-                elif 'is_active_else_def' in self.mode and 'else_body' in self.mode:
+                    self.scope_stack.pop()
                     self.mode = []
                 elif self.currentClass: # End class
+                    self.scope_stack.pop()
                     for interface_name in memory[self.currentClass]['implements']:
                         validateInterfaceImplementation(self.currentClass, interface_name)
                     self.currentClass = ''
                 elif self.currentInterface:
+                    self.scope_stack.pop()
                     self.currentInterface = ''
                 else:
                     raise SyntaxError(f'Unexpected closing brace at pos {token.getPos()["pos"]}')
@@ -3507,16 +3531,17 @@ class Execution:
                     filePath += text
                 filePath += '.txt' # Add .txt
                 filePath = (Path(__file__).parent / 'packages' / filePath)
+                packageName = ''.join(directory)
                 try:
                     thisPackageContent = filePath.read_text('utf-8')
                 except FileNotFoundError:
-                    raise FileNotFoundError(f'The specified package, "{''.join(directory)}", does not exist in the packages folder')
-                print(f'[INFO]: Loading package {''.join(directory)}...')
+                    raise FileNotFoundError(f'The specified package, "{packageName}", does not exist in the packages folder')
+                print(f'[INFO]: Loading package {packageName}...')
                 start = time.time()
-                packageExecutor = Execution(Intepreter(thisPackageContent))
+                packageExecutor = Execution(Intepreter(thisPackageContent), packageName)
                 packageExecutor.executeTokens()
                 end = time.time()
-                print(f'[INFO]: Successfully loaded package {''.join(directory)}')
+                print(f'[INFO]: Successfully loaded package {packageName}')
                 print(f'[INFO]: Package loaded in {(round(end-start,1))* 10 **3}ms')
             elif tok_type == EvalTokens.TOKENS['class']:
                 self.mode = []
@@ -3547,13 +3572,13 @@ class Execution:
                         thisClassImplements.append(token.get()['val'])
 
                 if self.next() != 'extends':  # Check the next token after class name
-                    createClass(class_name, modifier, implements=thisClassImplements)
+                    createClass(class_name, modifier, self.packageName, implements=thisClassImplements)
                 else:
                     if self.info.get('hasSuper', False):
                         raise NameError(f'Class {class_name} cannot have multiple parent classes')
                     self.tokPosition += 1  # skip 'extends'
                     super_name = self.next()  # get superclass name
-                    createClass(class_name, modifier, ClassReference(super_name), thisClassImplements)
+                    createClass(class_name, modifier, self.packageName, ClassReference(super_name), thisClassImplements)
                 self.tokPosition = endClassDeclr-1
                 self.currentClass = class_name
                 self.clear()
@@ -3572,7 +3597,7 @@ class Execution:
                             else:
                                 break
                         supers.append(token.get()['val'])
-                createInterface(name, supers)
+                createInterface(name, self.packageName, supers)
                 self.currentInterface = name
                 jumpBy = len(supers) + 1 if len(supers) > 0 else 0
                 self.tokPosition += 2 + jumpBy # Skip to "{"
@@ -3620,7 +3645,7 @@ class Execution:
                     closePos = self.lang[scan].getPos()['pos']
                     body = source[openPos:closePos]
                     
-                    createConstructor(self.currentClass, modifier, body, constructorArgs)
+                    createConstructor(self.currentClass, modifier, self.packageName, body, constructorArgs)
                     self.tokPosition = scan + 1
             elif tok_type in ACCESS_MODIFIERS: # Applies context: 'method_def', 'field_def'
                 self.mode.extend(['method_def', 'field_def'])
@@ -3676,6 +3701,7 @@ class Execution:
                                 field_name,
                                 'public',  # modifier from context
                                 ClassType(class_name),
+                                self.packageName,
                                 parsed_value,
                                 isStatic=self.states['STATIC'],
                                 isFinal=self.states['FINAL']
@@ -3689,6 +3715,7 @@ class Execution:
                                 field_name,
                                 'public',
                                 ClassType(class_name),
+                                self.packageName,
                                 isStatic=self.states['STATIC'],
                                 isFinal=self.states['FINAL']
                             )
@@ -3713,12 +3740,12 @@ class Execution:
                 var_name, arrayType, array_value, self.tokPosition = result
                 setField(
                     ClassReference(self.currentClass), var_name, modifier,
-                    PrimitiveArrayWrapper(arrayType), array_value,
+                    PrimitiveArrayWrapper(arrayType), self.packageName, array_value,
                     isStatic=self.states['STATIC'], isFinal=self.states['FINAL']
                 )
                 self.clear(noClearMode=True, noClearInfo=True)
                 continue
-            elif tok_type == EvalTokens.TOKENS['('] and not is_constructor_call and self.before(2,'type') in (RETURN_TYPES + [EvalTokens.TOKENS['void']]): # METHOD
+            elif tok_type == EvalTokens.TOKENS['('] and not is_constructor_call and (self.before(2,'type') in (RETURN_TYPES + [EvalTokens.TOKENS['void']]) or isClass(self.before(2))): # METHOD
                 if 'method_def' in self.mode and self.currentClass and not self.currentInterface:
                     # <modifier>, <static?>, <return_type>, <method_name> ( <...>
                     #       4         3          2             1          ^ WE ARE HERE  
@@ -3779,7 +3806,7 @@ class Execution:
                     isAbstract = not has_body
                     isStatic = self.states['STATIC']
                     
-                    setInterfaceMethod(self.currentInterface, self.before(), methodReturnType, methodModifier, args, checkedExecs, isAbstract, isStatic)
+                    setInterfaceMethod(self.currentInterface, self.before(), methodReturnType, methodModifier, self.packageName, args, checkedExecs, isAbstract, isStatic)
                     self.clear(noClearMode=True, noClearInfo=True)
                     
                     if has_body:
@@ -3799,9 +3826,9 @@ class Execution:
         # Convert
         converted = convertValue(parsedValue, _type)
         if not interface:
-            setField(ClassReference(self.currentClass), self.next(), modifier, _type, converted, isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
+            setField(ClassReference(self.currentClass), self.next(), modifier, _type, self.packageName, converted, isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
         else:
-            setInterfaceField(self.currentInterface, self.next(), _type, converted)
+            setInterfaceField(self.currentInterface, self.next(), _type, self.packageName, converted)
         self.clear(noClearMode=True, noClearInfo=True)
     def handleArgumentDefinition(self):
         open_paren_idx = self.tokPosition 
@@ -3809,7 +3836,6 @@ class Execution:
         arg_tokens = self.lang[open_paren_idx + 1 : close_paren_idx]
         
         self.info['thisMethodArgs'] = {}
-        
         if arg_tokens:
             # Parse arguments from tokens
             arg_parts = []
@@ -3911,11 +3937,11 @@ class Execution:
         return parsed
     def handleNullFieldDefinition(self, _type: object, modifier: str, interface: bool = False):
         if not interface:
-            setField(ClassReference(self.currentClass), self.next(), modifier, _type, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
+            setField(ClassReference(self.currentClass), self.next(), modifier, _type, self.packageName, default_value_for_type(_type), isStatic=self.states['STATIC'], isFinal=self.states['FINAL'])
         else:
-            setInterfaceField(self.currentInterface, self.next, _type, default_value_for_type(_type))
+            setInterfaceField(self.currentInterface, self.next, _type, self.packageName, default_value_for_type(_type))
     def handleMethodDefinition(self, methodName: str, methodModifier: str, methodReturnType: object, isStatic: bool, methodArgs: dict, throws: list = []):
-        createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, isStatic, argsList(methodArgs), throws)
+        createMethod(ClassReference(self.currentClass), methodName, methodModifier, methodReturnType, self.packageName, isStatic, argsList(methodArgs), throws)
         self.clear(noClearMode=True, noClearInfo=True)
     def clear(self, noClearMode: bool = False, noClearArgStack: bool = False, noClearInfo: bool = False):
         if not noClearMode:
@@ -4007,7 +4033,8 @@ def invokeMethod(className: str, methodName: str, args: list, caller: str, thisR
 
         mModifier = mInfo['modifier']
         thisScope = perspectiveOfClass(caller, found_class)
-        isAllowedAtThisScope(mModifier, thisScope)
+        print(f"DEBUG: Checking {mInfo['name']} with modifier {mModifier}, thisScope={thisScope}, packageScope={packagePrespectiveOfClass(className, caller)}")
+        isAllowedAtThisScope(mModifier, thisScope, packagePrespectiveOfClass(className, caller), item=mInfo['name'])
     else:
         if not isInterface(className):
             raise NameError(f"Interface '{className}' is not defined")
@@ -4043,6 +4070,7 @@ while choice == 'Retry':
     while not foundFile:
         try:
             content = (Path(__file__).parent / fileName).read_text(encoding="utf-8")
+            current_file_path = Path(__file__).parent / fileName
             foundFile = True 
             continue
         except FileNotFoundError:
@@ -4052,9 +4080,24 @@ while choice == 'Retry':
     if oldContent == content:
         print(f'[WARNING]: File reloading did not detect any changes in file. Did you save the file {fileName}?')
     try:
+        def get_package_path():
+            if current_file_path is None:
+                return ""
+
+            file_dir = current_file_path.parent
+            pjdk_dir = Path(__file__).parent
+
+            try:
+                rel_path = file_dir.relative_to(pjdk_dir)
+            except ValueError:
+                return ".".join(file_dir.parts)
+            if rel_path == Path("."):
+                return "MainRuntime"
+
+            return ".".join(rel_path.parts)
         userArgs = input('[ENTER ARGS]: ')
         os.system('cls')
-        Exec = Execution(Intepreter(content))
+        Exec = Execution(Intepreter(content), get_package_path())
         print('CONSOLE OUTPUT:\n')
         Exec.executeTokens()
         try:
