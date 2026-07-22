@@ -3516,12 +3516,11 @@ class Method:
 
                 print('[OUTPUT]: ' + str(value), end=endChar)
                 self.tokPosition += len(expr_tokens) + 1  
-                if self.lang[self.tokPosition+1].get()['type'] != 'SEMICOLON':
+                if self.lang[self.tokPosition].get()['type'] != 'SEMICOLON':
                     raise EOFError('Unexpected reached end of line, when expected semicolon')
                 if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
                     self.tokPosition += 1
-                
-            
+                 
         self.tokPosition += 1
         return False
     def execute(self):
