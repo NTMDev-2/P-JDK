@@ -4,7 +4,7 @@ Used packages:
 typing
 operator
 pathlib
-os ( os.system was deprecated, and was bumped to subprocess.run )
+subprocess
 traceback
 time
 json
