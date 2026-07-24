@@ -4,7 +4,7 @@ from typing import Any#, Optional
 import operator as pyop
 from pathlib import Path
 import struct
-import os
+import subprocess
 import traceback
 import time
 
@@ -169,6 +169,10 @@ def isAllowedAtThisScope(modifier: str, thisScope: str, packageScope: str = 'thi
     else:
         raise PermissionError(f'Attempted to access item "{item}" without sufficient permission')
 def isConsistentTypes(thisType: object, otherType: object) -> bool:
+    if isinstance(otherType, ClassType):
+        if otherType.get() == 'Object':
+            return True
+
     if isinstance(otherType, Null) or otherType is Null and issubclass(thisType, Nullable):
         return True
     if isinstance(thisType, Null) or thisType is Null and issubclass(otherType, Nullable):
@@ -329,7 +333,7 @@ def isValidReturnType(selftype: object):
 def isChangeable(data: dict):
     if data['final']:
         raise Exception(f'This variable "{data['name']}" is final, and therefore cannot be modified')
-def createClass(className: str, classModifier: str, package: str, superClass: ClassReference = ClassReference('Object'), implements: list[str] = []):
+def createClass(className: str, classModifier: str, package: str, superClass: ClassReference = ClassReference('Object'), implements: list[str] = [], isAbstract: bool = False):
     isValidModifier(classModifier)
     if className in memory:
         raise NameError(f"Class '{className}' is already defined")
@@ -361,7 +365,8 @@ def createClass(className: str, classModifier: str, package: str, superClass: Cl
                         'args': m_body['args'],
                         'throws': m_body.get('throws', []),
                         'abstract': True,
-                        'package': package
+                        'package': package,
+                        'abstract': isAbstract
                     }
                 elif not m_body.get('abstract', True) and m_name not in inherited and m_body.get('body'):
                     inherited[m_name] = {
@@ -373,7 +378,8 @@ def createClass(className: str, classModifier: str, package: str, superClass: Cl
                         'throws': m_body.get('throws', []),
                         'body': m_body['body'],
                         'abstract': False,
-                        'package': package
+                        'package': package,
+                        'abstract': isAbstract
                     }
 
     memory[className] = {
@@ -383,7 +389,8 @@ def createClass(className: str, classModifier: str, package: str, superClass: Cl
         'modifier': classModifier,
         'methods': inherited,
         'fields': inherited_fields,
-        'package': package
+        'package': package,
+        'abstract': isAbstract
     }
 def createMethod(thisClass: ClassReference, methodName: str, methodModifier: str, methodReturnType: object, package: str, isStatic: bool = False, methodArgs: dict = {}, throws: list = []):
     isValidReturnType(methodReturnType)
@@ -1733,7 +1740,7 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
                     
                     obj = newObject(className, evaled_args, me.class_name)
                 else:
-                    obj = newObject(className)
+                    obj = newObject(className, callerClass=me.class_name)
                 
                 out.append(Token.wrap(obj))
                 i = closeParen + 1
@@ -1747,7 +1754,8 @@ def collapseTokenSlice(me: StackFrame | None, methodArgs: list | None, tokens: T
             # (<type>) <value> <...?>;
             castToType = tokens[i+1].get()['type']
             castValue = tokens[i+1].get()['val']
-            if not isClass(castValue) or castToType not in RETURN_TYPES:
+
+            if not isClass(castValue) and castToType not in RETURN_TYPES:
                 raise NameError(f'Could not cast to type {castValue}')
             i += 3 # skip (<type>)
             parenDepth = 0
@@ -3504,7 +3512,10 @@ class Method:
                 expr_tokens = self.readUntilMatching(self.peek(), '(', ')')
                 
                 inner_tokens = expr_tokens[1:-1]
-                value = Expression.evaluate(self.me, self.me.getArgs(), inner_tokens)
+                if len(inner_tokens) == 0:
+                    value = '\n'
+                else:
+                    value = Expression.evaluate(self.me, self.me.getArgs(), inner_tokens)
                 endChar = '\n' if tok_type == 'NATIVE_PRINT_STMT' else ''
                 if hasattr(value, 'get'):
                     value = value.get() if type(value.get()).__module__ == 'builtins' else f'[INTERNAL] {type(value.get()).__name__}@{hex(id(value.get()))}'
@@ -3520,7 +3531,7 @@ class Method:
                     raise EOFError('Unexpected reached end of line, when expected semicolon')
                 if self.tokPosition < len(self.lang) and self.lang[self.tokPosition].get()['type'] == 'SEMICOLON':
                     self.tokPosition += 1
-                 
+                
         self.tokPosition += 1
         return False
     def execute(self):
@@ -3682,15 +3693,20 @@ class Execution:
                 end = time.time()
                 print(f'[INFO]: Successfully loaded package {packageName}')
                 print(f'[INFO]: Package loaded in {(round(end-start,1))* 10 **3}ms')
-            elif tok_type == EvalTokens.TOKENS['class']:
+            elif tok_type == EvalTokens.TOKENS['class']: # CLASS
                 self.mode = []
                 modifier = ''
+                readModifierBy = 1
+                isThisAbstract = self.info.get('ABSTRACT', False)
+                if isThisAbstract:
+                    readModifierBy = -1
                 if self.tokPosition == 1:
                     modifier = 'default'
-                elif self.before() not in ('public', 'private', 'protected', 'default'):
+                elif self.before(readModifierBy) not in ('public', 'private', 'protected', 'default'):
                     modifier = 'default'
                 else:
-                    modifier = self.before()
+                    modifier = self.before(readModifierBy) 
+
                 isValidModifier(modifier)
                 
                 class_name = self.next()
@@ -3711,13 +3727,13 @@ class Execution:
                         thisClassImplements.append(token.get()['val'])
 
                 if self.next() != 'extends':  # Check the next token after class name
-                    createClass(class_name, modifier, self.packageName, implements=thisClassImplements)
+                    createClass(class_name, modifier, self.packageName, implements=thisClassImplements, isAbstract=isThisAbstract)
                 else:
                     if self.info.get('hasSuper', False):
                         raise NameError(f'Class {class_name} cannot have multiple parent classes')
                     self.tokPosition += 1  # skip 'extends'
                     super_name = self.next()  # get superclass name
-                    createClass(class_name, modifier, self.packageName, ClassReference(super_name), thisClassImplements)
+                    createClass(class_name, modifier, self.packageName, ClassReference(super_name), thisClassImplements, isThisAbstract)
                 self.tokPosition = endClassDeclr-1
                 self.currentClass = class_name
                 self.clear()
@@ -3748,10 +3764,12 @@ class Execution:
             elif tok_type == EvalTokens.TOKENS['static']: # Sets static
                 self.states['STATIC'] = True
                 self.info['readBy'] = self.info.get('readBy', 1) + 1 # This makes the modifier keyword 2 spaces behind
-            elif tok_type == EvalTokens.TOKENS['abstract']:
+            elif tok_type == EvalTokens.TOKENS['abstract']: # Sets abstract
                 self.states['ABSTRACT'] = True
                 self.info['readBy'] = self.info.get('readBy', 1) + 1
-            elif tok_type in ACCESS_MODIFIERS and self.next() == self.currentClass and self.next(2) == '(':
+            elif tok_type in ACCESS_MODIFIERS and self.next() == self.currentClass and self.next(2) == '(': # CONSTRUCTOR
+                if self.currentInterface:
+                    raise RuntimeError(f'Unexpected constructor {self.next()} (cannot define in interface context)')
                 modifier = tok_val
                 if tok_val == 'default':
                     raise NameError('Modifier "default" not allowed in constructor definition')
@@ -4213,7 +4231,7 @@ while choice == 'Retry':
         except FileNotFoundError:
             print(f'[WARNING]: The file {fileName} was not found in directory {Path(__file__).parent}')
             fileName = (input('Enter file name: ') + '.txt')
-    os.system('cls')
+    subprocess.run(['cls'], shell=True)
     if oldContent == content:
         print(f'[WARNING]: File reloading did not detect any changes in file. Did you save the file {fileName}?')
     try:
@@ -4233,7 +4251,7 @@ while choice == 'Retry':
 
             return ".".join(rel_path.parts)
         userArgs = input('[ENTER ARGS]: ')
-        os.system('cls')
+        subprocess.run(['cls'], shell=True)
         Exec = Execution(Intepreter(content), get_package_path())
         print('CONSOLE OUTPUT:\n')
         Exec.executeTokens()
@@ -4265,5 +4283,5 @@ while choice == 'Retry':
     choice = 'Retry' if not input('\n[ENTER]: Reload file [OTHER+ENTER]: Exit console') else ''
     if choice == 'Retry':
         Exec.reset()
-    os.system('cls')
+    subprocess.run(['cls'], shell=True)
     oldContent = content
